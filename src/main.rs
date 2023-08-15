@@ -7,7 +7,6 @@
 use std::{
     alloc::Layout,
     collections::VecDeque,
-    mem::MaybeUninit,
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
         Arc,
@@ -49,6 +48,7 @@ fn test_vec_buf() {
 
 pub struct SliceBuf<T> {
     capacity: usize,
+    data_layout: Layout,
     data_start: AtomicPtr<T>,
     write_offset: AtomicUsize,
     read_offset: AtomicUsize,
@@ -59,10 +59,10 @@ impl<T> SliceBuf<T> {
         Self::with_capacity(4)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        // TOOD: Handle multiple allocations and potential data races.
-        self.write_offset.load(Ordering::Acquire) - self.read_offset.load(Ordering::Acquire)
-    }
+    // pub(crate) fn len(&self) -> usize {
+    //     // TOOD: Handle multiple allocations and potential data races.
+    //     self.write_offset.load(Ordering::Acquire) - self.read_offset.load(Ordering::Acquire)
+    // }
 
     pub(crate) fn remaining_capacity(&self) -> usize {
         // TOOD: Handle multiple allocations and potential data races.
@@ -75,12 +75,11 @@ impl<T> SliceBuf<T> {
         assert_ne!(size_of_t, 0);
         assert!(!std::mem::needs_drop::<T>());
 
-        let data_start = unsafe {
-            std::alloc::alloc(Layout::from_size_align(size_of_t * capacity, align_of_t).unwrap())
-        }
-        .cast();
+        let data_layout = Layout::from_size_align(size_of_t * capacity, align_of_t).unwrap();
+        let data_start = unsafe { std::alloc::alloc(data_layout) }.cast();
         Self {
             capacity,
+            data_layout,
             data_start: AtomicPtr::from(data_start),
             write_offset: AtomicUsize::new(0),
             read_offset: AtomicUsize::new(0),
@@ -95,6 +94,24 @@ impl<T> SliceBuf<T> {
             },
             SliceBufReader { shared },
         )
+    }
+}
+
+impl<T> Default for SliceBuf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Drop for SliceBuf<T> {
+    fn drop(&mut self) {
+        assert!(!std::mem::needs_drop::<T>());
+        unsafe {
+            std::alloc::dealloc(
+                self.data_start.load(Ordering::Acquire).cast(),
+                self.data_layout,
+            )
+        }
     }
 }
 
@@ -171,6 +188,10 @@ impl<T> VecSliceBuf<T> {
         self.buf.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     pub fn push(&mut self, value: T) {
         assert_eq!(self.buf.capacity(), self.max_capa);
         if self.buf.len() == self.buf.capacity() {
@@ -212,6 +233,12 @@ impl<T> VecSliceBuf<T> {
     // pub fn push_within_capacity(&mut self, value: T) -> Result<(), T> {
     //     self.buf.push_within_capacity()
     // }
+}
+
+impl<T> Default for VecSliceBuf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // pub trait SliceBufRead<'data, T> {
