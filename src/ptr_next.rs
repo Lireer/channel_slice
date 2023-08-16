@@ -7,12 +7,15 @@ use std::{
 };
 
 /// Only for types for which `mem::needs_drop` returns false.
+#[derive(Debug)]
 pub struct SliceBuf<T> {
     capacity: usize,
     data_layout: Layout,
     write_offset: AtomicUsize,
     read_offset: AtomicUsize,
     data_start: AtomicPtr<T>,
+    // If the ptr is not null, it means
+    next: (AtomicPtr<Self>, AtomicUsize),
 }
 
 impl<T> SliceBuf<T> {
@@ -44,6 +47,7 @@ impl<T> SliceBuf<T> {
             data_start: AtomicPtr::from(data_start),
             write_offset: AtomicUsize::new(0),
             read_offset: AtomicUsize::new(0),
+            next: (AtomicPtr::new(std::ptr::null_mut()), AtomicUsize::new(0)),
         }
     }
 
@@ -72,27 +76,55 @@ impl<T> Drop for SliceBuf<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct SliceBufReader<T> {
     shared: Arc<SliceBuf<T>>,
 }
 
 impl<T> SliceBufReader<T> {
+    pub fn synchronize(&mut self) {
+        loop {
+            let next_buf = self
+                .shared
+                .next
+                .0
+                .swap(std::ptr::null_mut(), Ordering::Acquire);
+
+            if next_buf.is_null() {
+                // No new instance to worry about.
+                break;
+            }
+
+            // There's a new SliceBuf instance
+            let next = unsafe { Arc::from_raw(next_buf) };
+            // Get read_offset that was used when creating the new SliceBuf.
+            let used_read_offset = self.shared.next.1.load(Ordering::Acquire);
+            let read_offset_diff =
+                self.shared.read_offset.load(Ordering::Relaxed) - used_read_offset;
+
+            // Update read_offset in next SliceBuf to reflect possible changes after the its creation.
+            // TODO: Could this be relaxed?
+            next.read_offset.store(read_offset_diff, Ordering::Release);
+            self.shared = next;
+        }
+    }
+
     pub fn slice_to(&self, to: usize) -> Option<&[T]> {
         let read_offset = self.shared.read_offset.load(Ordering::Relaxed);
-        let start = unsafe {
+        let write_offset = self.shared.write_offset.load(Ordering::Acquire);
+        let read_start = unsafe {
             self.shared
                 .data_start
                 .load(Ordering::Acquire)
                 .add(read_offset)
         };
-        let write_offset = self.shared.write_offset.load(Ordering::Acquire);
         let len = write_offset - read_offset;
 
         if to > len {
             return None;
         }
 
-        Some(unsafe { std::slice::from_raw_parts(start, to) })
+        Some(unsafe { std::slice::from_raw_parts(read_start, to) })
     }
 
     pub fn consume(&mut self, n: usize) {
@@ -104,22 +136,60 @@ impl<T> SliceBufReader<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct SliceBufWriter<T> {
     shared: Arc<SliceBuf<T>>,
 }
 
 impl<T> SliceBufWriter<T> {
     pub fn push(&mut self, value: T) {
-        assert!(self.shared.remaining_capacity() > 0);
-        // TODO: Allocate new buf.
+        let mut offset = self.shared.write_offset.load(Ordering::Relaxed);
+
+        if offset >= self.shared.capacity {
+            // New allocation is needed.
+
+            // Create a new SliceBuf from the previous instance.
+
+            // TODO: smarter new capacity
+            let mut new = SliceBuf::with_capacity(self.shared.capacity * 2);
+            // Use read_offset from old alloc so the reader can use that during syncronization.
+            let old_read_offset = self.shared.read_offset.load(Ordering::Acquire);
+            // Copy data after read_offset to new buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.shared
+                        .data_start
+                        .load(Ordering::Relaxed)
+                        .add(old_read_offset),
+                    *new.data_start.get_mut(),
+                    offset - old_read_offset,
+                )
+            };
+
+            // Reduce the write_offset by the number of elements consumed by the reader.
+            offset -= old_read_offset;
+
+            let new = Arc::new(new);
+
+            // Update old slicebuf with information for the reader.
+
+            // Store .1 first since the reader will always check .0 first.
+            self.shared.next.1.store(old_read_offset, Ordering::Release);
+            self.shared
+                .next
+                .0
+                .store(Arc::into_raw(new.clone()).cast_mut(), Ordering::Release);
+
+            // Update the writers instance to the newly allocated SliceBuf.
+
+            self.shared = new;
+        }
+
+        // TODO: Could this be moved in front of the alloc block to only load this value once?
+        let data_start = self.shared.data_start.load(Ordering::Relaxed);
 
         unsafe {
-            let offset = self.shared.write_offset.load(Ordering::Relaxed);
-            self.shared
-                .data_start
-                .load(Ordering::Relaxed)
-                .add(offset)
-                .write(value);
+            data_start.add(offset).write(value);
             self.shared
                 .write_offset
                 .store(offset + 1, Ordering::Release);
@@ -129,7 +199,7 @@ impl<T> SliceBufWriter<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::arc_next::SliceBuf;
+    use super::SliceBuf;
 
     #[test]
     fn single_thread_slice_buf() {
@@ -179,5 +249,31 @@ mod tests {
         let mut writer = handle.join().unwrap();
 
         writer.push(1000);
+        assert_eq!(reader.slice_to(1), None);
+
+        reader.synchronize();
+        assert_eq!(reader.slice_to(1).unwrap(), &[1000]);
+    }
+
+    #[test]
+    fn alloc_chain() {
+        let n = 2;
+        let buf = SliceBuf::with_capacity(n);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..16 {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.slice_to(2).unwrap(), &[0, 1]);
+        reader.consume(2);
+        assert_eq!(reader.slice_to(1), None);
+
+        reader.synchronize();
+
+        assert_eq!(reader.slice_to(15), None);
+        let full_slice = reader.slice_to(14).unwrap();
+        assert_eq!(full_slice[0], 2);
+        assert_eq!(full_slice[13], 15);
     }
 }

@@ -1,5 +1,5 @@
-pub mod arc_next;
 pub mod expl_sync;
+pub mod ptr_next;
 pub mod ptr_realloc;
 pub mod vec_internal;
 
