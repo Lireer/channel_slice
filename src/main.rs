@@ -106,12 +106,7 @@ impl<T> Default for SliceBuf<T> {
 impl<T> Drop for SliceBuf<T> {
     fn drop(&mut self) {
         assert!(!std::mem::needs_drop::<T>());
-        unsafe {
-            std::alloc::dealloc(
-                self.data_start.load(Ordering::Acquire).cast(),
-                self.data_layout,
-            )
-        }
+        unsafe { std::alloc::dealloc(self.data_start.get_mut().cast(), self.data_layout) }
     }
 }
 
@@ -219,14 +214,6 @@ impl<T> VecSliceBuf<T> {
     }
 
     pub fn consume(&mut self, n: usize) {
-        // if n > self.buf.len() {
-        //     panic!(
-        //         "index out of bounds: the len is {} but the index is {}",
-        //         self.buf.len(),
-        //         n + 1
-        //     )
-        // }
-
         _ = self.buf.drain(..n);
     }
 
