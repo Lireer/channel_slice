@@ -13,38 +13,7 @@ use std::{
     },
 };
 
-fn main() {
-    let buf = SliceBuf::with_capacity(100);
-    let (mut writer, mut reader) = buf.split();
-
-    for i in 0..100 {
-        writer.push(i);
-    }
-
-    assert_eq!(reader.shared.remaining_capacity(), 0);
-    reader.consume(60);
-    assert_eq!(reader.slice_to(0).unwrap(), &[]);
-    assert_eq!(reader.slice_to(3).unwrap(), &[60, 61, 62]);
-
-    test_vec_buf();
-}
-
-fn test_vec_buf() {
-    let mut buf = VecSliceBuf::new();
-
-    for i in 0..100 {
-        buf.push(i);
-    }
-    assert_eq!(buf.len(), 100);
-
-    let values = buf.slice_to(50).unwrap();
-    assert_eq!(values.len(), 50);
-    let values = buf.slice_to(buf.len()).unwrap();
-    assert_eq!(values.len(), buf.len());
-
-    buf.consume(100);
-    assert_eq!(buf.len(), 0);
-}
+fn main() {}
 
 pub struct SliceBuf<T> {
     capacity: usize,
@@ -278,3 +247,71 @@ impl<T> Default for VecSliceBuf<T> {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use crate::{SliceBuf, VecSliceBuf};
+
+    #[test]
+    fn vec_slice_buf() {
+        let mut buf = VecSliceBuf::new();
+
+        for i in 0..100 {
+            buf.push(i);
+        }
+        assert_eq!(buf.len(), 100);
+
+        let values = buf.slice_to(50).unwrap();
+        assert_eq!(values.len(), 50);
+        let values = buf.slice_to(buf.len()).unwrap();
+        assert_eq!(values.len(), buf.len());
+
+        buf.consume(100);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn single_thread_slice_buf() {
+        let buf = SliceBuf::with_capacity(100);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..100 {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.shared.remaining_capacity(), 0);
+        reader.consume(60);
+        assert_eq!(reader.slice_to(0).unwrap(), &[]);
+        assert_eq!(reader.slice_to(3).unwrap(), &[60, 61, 62]);
+    }
+
+    #[test]
+    fn multi_thread_slice_buf() {
+        let n = 100;
+        let buf = SliceBuf::with_capacity(n);
+        let (mut writer, mut reader) = buf.split();
+
+        std::thread::spawn(move || {
+            for i in 0..100 {
+                writer.push(i);
+            }
+        });
+
+        let mut next_expected = 0;
+
+        loop {
+            if let Some(slice) = reader.slice_to(5) {
+                assert_eq!(slice.len(), 5);
+                assert_eq!(slice[0], next_expected);
+                next_expected += 4;
+                assert_eq!(slice[4], next_expected);
+                next_expected += 1;
+                reader.consume(5);
+            }
+
+            if next_expected >= n {
+                break;
+            }
+        }
+    }
+}
