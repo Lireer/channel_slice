@@ -129,7 +129,7 @@ impl<T> SliceBufWriter<T> {
                 .write(value);
             self.shared
                 .write_offset
-                .store(offset + 1, Ordering::Relaxed);
+                .store(offset + 1, Ordering::Release);
         }
     }
 }
