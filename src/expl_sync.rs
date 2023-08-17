@@ -198,6 +198,8 @@ impl<T> SliceBufWriter<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::SliceBuf;
 
     #[test]
@@ -274,5 +276,88 @@ mod tests {
         let full_slice = reader.slice_to(14).unwrap();
         assert_eq!(full_slice[0], 2);
         assert_eq!(full_slice[13], 15);
+    }
+
+    #[test]
+    fn single_alloc_drop_reader() {
+        let n = 10;
+        let buf = SliceBuf::with_capacity(n);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..n {
+            writer.push(i);
+        }
+
+        reader.consume(2);
+
+        drop(reader);
+    }
+
+    #[test]
+    fn single_alloc_drop_writer() {
+        let n = 10;
+        let buf = SliceBuf::with_capacity(n);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..n {
+            writer.push(i);
+        }
+
+        reader.consume(2);
+
+        drop(writer);
+    }
+
+    #[test]
+    fn multi_alloc_drop_reader() {
+        let capa = 2;
+        let len = 20;
+        let buf = SliceBuf::with_capacity(capa);
+        let (mut writer, reader) = buf.split();
+
+        for i in 0..len {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.shared.write_offset.load(Ordering::SeqCst), 2);
+
+        drop(reader);
+
+        for _ in 0..40 {
+            writer.push(len);
+        }
+    }
+
+    #[test]
+    fn multi_alloc_drop_writer() {
+        let capa = 2;
+        let len = 20;
+        let buf = SliceBuf::with_capacity(capa);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..len {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.shared.write_offset.load(Ordering::SeqCst), 2);
+
+        reader.consume(2);
+
+        drop(writer);
+
+        assert_ne!(
+            reader.shared.next.0.load(Ordering::SeqCst),
+            std::ptr::null_mut()
+        );
+
+        reader.synchronize();
+
+        assert_eq!(
+            reader.shared.next.0.load(Ordering::SeqCst),
+            std::ptr::null_mut()
+        );
+
+        assert_eq!(reader.slice_to(19), None);
+        assert_eq!(reader.slice_to(18).unwrap().last(), Some(&19));
     }
 }
