@@ -2,56 +2,22 @@ pub mod expl_sync;
 pub mod ptr_next;
 pub mod ptr_realloc;
 pub mod vec_internal;
+pub mod vecdeque;
 
 fn main() {}
 
-// pub trait SliceBufRead<'data, T> {
-//     type Slice;
-//     fn slice(&'data mut self, range: impl SliceIndex<usize>) -> Self::Slice;
-//     fn take(&mut self, n: usize) -> Vec<T>;
-// }
+pub trait SliceBufRead<T> {
+    type Slice<'data>
+    where
+        Self: 'data;
+    fn slice_to<'data>(&'data self, to: usize) -> Option<Self::Slice<'data>>;
+    fn consume(&mut self, n: usize);
+}
 
-// pub trait SliceBufWrite<T> {
-//     fn append(&mut self, data: &[T])
-//     where
-//         T: Clone;
-//     fn append_vec(&mut self, data: Vec<T>);
-// }
-
-// pub struct MutexVecDeque<T> {
-//     // guard: Option<MutexGuard<'a, VecDeque<T>>>,
-//     buf: Mutex<VecDeque<T>>,
-// }
-
-// impl<'data, T: 'data> SliceBufRead<'data, T> for MutexVecDeque<T> {
-//     type Slice = (MutexGuard<'data, VecDeque<T>>, &'data [T]);
-
-//     fn slice(&'data mut self, range: impl SliceIndex<usize>) -> Self::Slice {
-//         let mut guard = self.buf.lock().unwrap();
-//         let slice = guard.make_contiguous();
-//         (guard, slice)
-//     }
-
-//     fn take(&mut self, n: usize) -> Vec<T> {
-//         self.buf.lock().unwrap().drain(..n).collect()
-//     }
-// }
-
-// impl<T> SliceBufWrite<T> for Arc<Mutex<VecDeque<T>>> {
-//     fn append(&mut self, slice: &[T])
-//     where
-//         T: Clone,
-//     {
-//         let mut buf = self.lock().unwrap();
-//         for elem in slice {
-//             buf.push_back(elem.clone())
-//         }
-//     }
-
-//     fn append_vec(&mut self, data: Vec<T>) {
-//         let mut buf = self.lock().unwrap();
-//         for elem in data.into_iter() {
-//             buf.push_back(elem)
-//         }
-//     }
-// }
+pub trait SliceBufWrite<T> {
+    fn push(&mut self, data: T);
+    fn append(&mut self, data: &[T])
+    where
+        T: Clone;
+    fn append_vec(&mut self, data: Vec<T>);
+}
