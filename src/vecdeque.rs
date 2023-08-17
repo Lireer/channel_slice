@@ -22,6 +22,12 @@ impl<T> MutexVecDeque<T> {
     }
 }
 
+impl<T> Default for MutexVecDeque<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> SliceBufRead<T> for Arc<MutexVecDeque<T>> {
     type Slice<'data> = MappedMutexGuard<'data, [T]> where T: 'data;
 

@@ -27,7 +27,7 @@ impl<T> SliceBuf<T> {
     //     self.write_offset.load(Ordering::Acquire) - self.read_offset.load(Ordering::Acquire)
     // }
 
-    pub(crate) fn remaining_capacity(&self) -> usize {
+    pub fn remaining_capacity(&self) -> usize {
         // TOOD: Handle multiple allocations and potential data races.
         self.capacity - self.write_offset.load(Ordering::Relaxed)
     }
