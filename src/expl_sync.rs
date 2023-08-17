@@ -135,10 +135,11 @@ impl<T> SliceBufReader<T> {
     }
 
     pub fn consume(&mut self, n: usize) {
-        // TODO: How should this behave when multiple allocations exist?
-        // TODO: Maybe change ordering when writer also accesses read_offset.
+        // TODO: How should this behave if multiple allocations exist?
+        // TODO: Maybe change ordering if writer also accesses read_offset.
 
         let old_val = self.shared.read_offset.fetch_add(n, Ordering::Release);
+
         assert!(old_val + n <= self.shared.write_offset.load(Ordering::Acquire));
     }
 }
@@ -262,6 +263,22 @@ mod tests {
 
         reader.synchronize();
         assert_eq!(reader.slice_to(1).unwrap(), &[1000]);
+    }
+
+    #[test]
+    fn consume_too_many() {
+        let len = 10;
+        let buf = SliceBuf::with_capacity(len);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..len {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.slice_to(10).unwrap().last(), Some(&9));
+        reader.consume(10);
+        assert_eq!(reader.slice_to(1), None);
+        reader.consume(1);
     }
 
     #[test]
