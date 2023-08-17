@@ -69,9 +69,17 @@ impl<T> Default for SliceBuf<T> {
 
 impl<T> Drop for SliceBuf<T> {
     fn drop(&mut self) {
-        // TODO: Drop elements between read_offset and
+        // TODO: Drop elements between read_offset and write_offset
         assert!(!std::mem::needs_drop::<T>());
+
+        // Deallocate the memory used for this buffer.
         unsafe { std::alloc::dealloc(self.data_start.get_mut().cast(), self.data_layout) }
+
+        // If a next allocation exists, try to drop that too.
+        let next = self.next.0.load(Ordering::Relaxed);
+        if !next.is_null() {
+            _ = unsafe { Arc::from_raw(next) };
+        }
     }
 }
 
