@@ -119,17 +119,18 @@ impl<T> SliceBufReader<T> {
     pub fn slice_to(&self, to: usize) -> Option<&[T]> {
         let read_offset = self.shared.read_offset.load(Ordering::Relaxed);
         let write_offset = self.shared.write_offset.load(Ordering::Acquire);
+        let len = write_offset - read_offset;
+
+        if to > len {
+            return None;
+        }
+
         let read_start = unsafe {
             self.shared
                 .data_start
                 .load(Ordering::Acquire)
                 .add(read_offset)
         };
-        let len = write_offset - read_offset;
-
-        if to > len {
-            return None;
-        }
 
         Some(unsafe { std::slice::from_raw_parts(read_start, to) })
     }
