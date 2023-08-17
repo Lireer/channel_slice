@@ -1,6 +1,6 @@
 pub mod expl_sync;
-pub mod ptr_next;
-pub mod ptr_realloc;
+// pub mod ptr_next;
+// pub mod ptr_realloc;
 pub mod vec_internal;
 pub mod vecdeque;
 
@@ -10,7 +10,7 @@ pub trait SliceBufRead<T> {
     type Slice<'data>
     where
         Self: 'data;
-    fn slice_to<'data>(&'data self, to: usize) -> Option<Self::Slice<'data>>;
+    fn slice_to(&self, to: usize) -> Option<Self::Slice<'_>>;
     fn consume(&mut self, n: usize);
 }
 

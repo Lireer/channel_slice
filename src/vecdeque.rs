@@ -25,7 +25,7 @@ impl<T> MutexVecDeque<T> {
 impl<T> SliceBufRead<T> for Arc<MutexVecDeque<T>> {
     type Slice<'data> = MappedMutexGuard<'data, [T]> where T: 'data;
 
-    fn slice_to<'data>(&'data self, to: usize) -> Option<Self::Slice<'data>> {
+    fn slice_to(&self, to: usize) -> Option<Self::Slice<'_>> {
         let guard = self.buf.lock();
         if to > guard.len() {
             return None;
