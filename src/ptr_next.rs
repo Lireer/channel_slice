@@ -223,7 +223,7 @@ mod tests {
         let (mut writer, mut reader) = buf.split();
 
         let handle = std::thread::spawn(move || {
-            for i in 0..100 {
+            for i in 0..n {
                 writer.push(i);
             }
             writer
