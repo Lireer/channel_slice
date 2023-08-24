@@ -150,7 +150,14 @@ impl<T> SliceBufReader<T> {
 
         let old_val = self.shared.read_offset.fetch_add(n, Ordering::Release);
 
-        assert!(old_val + n <= self.shared.write_offset.load(Ordering::Acquire));
+        let write_offset = self.shared.write_offset.load(Ordering::Acquire);
+        if old_val + n > write_offset {
+            panic!(
+                "old_val + n is greater than self.shared.write_offset: {} > {}",
+                dbg!(old_val) + dbg!(n),
+                write_offset
+            );
+        }
     }
 }
 
