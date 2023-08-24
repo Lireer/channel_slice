@@ -4,8 +4,6 @@ pub mod expl_sync;
 pub mod vec_internal;
 pub mod vecdeque;
 
-fn main() {}
-
 pub trait SliceBufRead<T> {
     type Slice<'data>
     where
