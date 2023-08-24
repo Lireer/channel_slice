@@ -193,6 +193,7 @@ impl<T> SliceBufWriter<T> {
 
             // Reduce the write_offset by the number of elements consumed by the reader.
             offset -= old_read_offset;
+            new.write_offset = AtomicUsize::new(offset);
 
             let new = Arc::new(new);
 
