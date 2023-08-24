@@ -35,15 +35,24 @@ impl<T> SliceBuf<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         let size_of_t = std::mem::size_of::<T>();
         let align_of_t = std::mem::align_of::<T>();
-        assert_ne!(size_of_t, 0);
-        assert!(!std::mem::needs_drop::<T>());
+        assert_ne!(capacity, 0, "capacity is 0 but must be at least 1");
+        assert_ne!(size_of_t, 0, "zero sized types are currenty not supported");
+        assert!(
+            !std::mem::needs_drop::<T>(),
+            "types that need to be dropped are currently not supported"
+        );
 
         let data_layout = Layout::from_size_align(size_of_t * capacity, align_of_t).unwrap();
-        let data_start = unsafe { std::alloc::alloc(data_layout) }.cast();
+        let data_start = unsafe { std::alloc::alloc(data_layout) };
+        if data_start.is_null() {
+            // Abort if allocation failed, see `alloc` function for more information.
+            std::alloc::handle_alloc_error(data_layout);
+        }
+
         Self {
             capacity,
             data_layout,
-            data_start: AtomicPtr::from(data_start),
+            data_start: AtomicPtr::from(data_start.cast()),
             write_offset: AtomicUsize::new(0),
             read_offset: AtomicUsize::new(0),
             next: (AtomicPtr::new(std::ptr::null_mut()), AtomicUsize::new(0)),
@@ -213,6 +222,14 @@ mod tests {
     use super::SliceBuf;
 
     #[test]
+    #[should_panic(expected = "capacity is 0 but must be at least 1")]
+    fn zero_initial_capacity() {
+        let vec: Vec<u32> = Vec::with_capacity(0);
+        assert_eq!(vec.capacity(), 0);
+        SliceBuf::<u32>::with_capacity(0);
+    }
+
+    #[test]
     fn single_thread_slice_buf() {
         let buf = SliceBuf::with_capacity(100);
         let (mut writer, mut reader) = buf.split();
@@ -264,6 +281,43 @@ mod tests {
 
         reader.synchronize();
         assert_eq!(reader.slice_to(1).unwrap(), &[1000]);
+    }
+
+    #[test]
+    pub fn read_until_end_of_alloc() {
+        let buf = SliceBuf::with_capacity(100);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..100 {
+            writer.push(i);
+        }
+
+        reader.consume(100);
+    }
+
+    #[test]
+    pub fn allac_after_full_read() {
+        let init_capa = 2;
+        let (mut writer, mut reader) = SliceBuf::with_capacity(init_capa).split();
+
+        for i in 0..init_capa {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.slice_to(init_capa).unwrap(), &[0, 1]);
+
+        reader.consume(init_capa);
+        assert_eq!(reader.slice_to(1), None);
+
+        let new_elem = init_capa + 1;
+        writer.push(new_elem);
+        assert_eq!(reader.slice_to(1), None);
+
+        reader.synchronize();
+        assert_eq!(reader.slice_to(1).unwrap(), &[new_elem]);
+
+        reader.consume(1);
+        assert_eq!(reader.slice_to(1), None);
     }
 
     #[test]
