@@ -1,10 +1,8 @@
 use std::{
     alloc::Layout,
-    sync::{
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+use triomphe::Arc;
 
 /// Only for types for which `mem::needs_drop` returns false.
 #[derive(Debug)]
