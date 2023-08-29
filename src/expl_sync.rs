@@ -14,7 +14,7 @@ pub struct SliceBuf<T> {
     write_offset: AtomicUsize,
     read_offset: AtomicUsize,
     // TODO: Could this just be a plain raw pointer instead of an atomic?
-    data_start: AtomicPtr<T>,
+    data_start: *mut T,
     next: (AtomicPtr<Self>, AtomicUsize),
 }
 
@@ -53,7 +53,7 @@ impl<T> SliceBuf<T> {
         Self {
             capacity,
             data_layout,
-            data_start: AtomicPtr::from(data_start.cast()),
+            data_start: data_start.cast(),
             write_offset: AtomicUsize::new(0),
             read_offset: AtomicUsize::new(0),
             next: (AtomicPtr::new(std::ptr::null_mut()), AtomicUsize::new(0)),
@@ -83,7 +83,7 @@ impl<T> Drop for SliceBuf<T> {
         assert!(!std::mem::needs_drop::<T>());
 
         // Deallocate the memory used for this buffer.
-        unsafe { std::alloc::dealloc(self.data_start.get_mut().cast(), self.data_layout) }
+        unsafe { std::alloc::dealloc(self.data_start.cast(), self.data_layout) }
 
         // If a next allocation exists, try to drop that too.
         let next = self.next.0.load(Ordering::Relaxed);
@@ -92,6 +92,9 @@ impl<T> Drop for SliceBuf<T> {
         }
     }
 }
+
+unsafe impl<T> Sync for SliceBuf<T> where T: Sync {}
+unsafe impl<T> Send for SliceBuf<T> where T: Send {}
 
 #[derive(Debug)]
 pub struct SliceBufReader<T> {
@@ -135,12 +138,7 @@ impl<T> SliceBufReader<T> {
             return None;
         }
 
-        let read_start = unsafe {
-            self.shared
-                .data_start
-                .load(Ordering::Acquire)
-                .add(read_offset)
-        };
+        let read_start = unsafe { self.shared.data_start.add(read_offset) };
 
         Some(unsafe { std::slice::from_raw_parts(read_start, to) })
     }
@@ -181,7 +179,7 @@ pub struct SliceBufWriter<T> {
 
 impl<T> SliceBufWriter<T> {
     pub fn push(&mut self, value: T) {
-        let mut data_start = self.shared.data_start.load(Ordering::Relaxed);
+        let mut data_start = self.shared.data_start;
         let mut write_offset = self.shared.write_offset.load(Ordering::Relaxed);
 
         if write_offset >= self.shared.capacity {
@@ -210,11 +208,11 @@ impl<T> SliceBufWriter<T> {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data_start.add(old_read_offset),
-                    *new.data_start.get_mut(),
+                    new.data_start,
                     write_offset,
                 )
             };
-            data_start = *new.data_start.get_mut();
+            data_start = new.data_start;
 
             new.write_offset = AtomicUsize::new(write_offset);
 
@@ -247,7 +245,7 @@ impl<T> SliceBufWriter<T> {
         let iter = iter.into_iter();
         let iter_len = iter.len();
 
-        let mut data_start = self.shared.data_start.load(Ordering::Relaxed);
+        let mut data_start = self.shared.data_start;
         let mut write_offset = self.shared.write_offset.load(Ordering::Relaxed);
 
         // TODO: Maybe panic if the addition results in an overflow or the
@@ -278,11 +276,11 @@ impl<T> SliceBufWriter<T> {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data_start.add(old_read_offset),
-                    *new.data_start.get_mut(),
+                    new.data_start,
                     write_offset,
                 )
             };
-            data_start = *new.data_start.get_mut();
+            data_start = new.data_start;
 
             new.write_offset = AtomicUsize::new(write_offset);
 
@@ -374,8 +372,7 @@ mod tests {
                 "\nleft: {left:#?}\nright: {right:#?}"
             );
             assert!(
-                l_data_start.load(Ordering::Acquire).is_null()
-                    == r_data_start.load(Ordering::Acquire).is_null(),
+                l_data_start.is_null() == r_data_start.is_null(),
                 "\nleft: {left:#?}\nright: {right:#?}"
             );
             assert!(
@@ -492,7 +489,7 @@ mod tests {
 
     // TODO: This test shouldn't fail, it's just marked as ignore for now.
     #[test]
-    #[ignore]
+    #[should_panic(expected = "11 > 10")]
     fn consume_too_many() {
         let len = 10;
         let buf = SliceBuf::with_capacity(len);
