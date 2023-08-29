@@ -118,7 +118,7 @@ impl<T> SliceBufReader<T> {
             let read_offset_diff =
                 self.shared.read_offset.load(Ordering::Relaxed) - used_read_offset;
 
-            // Update read_offset in next SliceBuf to reflect possible changes after the its creation.
+            // Update read_offset in next SliceBuf to reflect possible changes after its creation.
             // TODO: Could this be relaxed?
             next.read_offset.store(read_offset_diff, Ordering::Release);
             self.shared = next;
@@ -211,15 +211,78 @@ impl<T> SliceBufWriter<T> {
             self.shared = new;
         }
 
-        // TODO: Could this be moved in front of the alloc block to only load this value once?
-        let data_start = self.shared.data_start.load(Ordering::Relaxed);
+    pub fn push_exact<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let iter = iter.into_iter();
+        let iter_len = iter.len();
 
+        let mut data_start = self.shared.data_start.load(Ordering::Relaxed);
+        let mut write_offset = self.shared.write_offset.load(Ordering::Relaxed);
+
+        // TODO: Maybe panic if the addition results in an overflow or the
+        //       result is bigger than isize::MAX?
+        if write_offset + iter_len > self.shared.capacity {
+            // Not enough space left in current SliceBuf, a new allocation is
+            // required.
+
+            // ++ Create a new SliceBuf from the previous instance.
+
+            // Use read_offset from old alloc, so it's available for the reader
+            // when switching to the next alloc.
+            let old_read_offset = self.shared.read_offset.load(Ordering::Acquire);
+            write_offset -= old_read_offset;
+
+            let new_len = write_offset + iter_len;
+            let new_capacity = if new_len > self.shared.capacity / 2 {
+                // Capacity of new buf should be at least twice the number of
+                // it's initial elements.
+                self.shared.capacity * 2
+            } else {
+                self.shared.capacity
+            }
+            .max(new_len); // at least enough for all elements
+            let mut new = SliceBuf::with_capacity(new_capacity);
+
+            // Copy data after read_offset to new buffer.
         unsafe {
-            data_start.add(offset).write(value);
+                std::ptr::copy_nonoverlapping(
+                    data_start.add(old_read_offset),
+                    *new.data_start.get_mut(),
+                    write_offset,
+                )
+            };
+            data_start = *new.data_start.get_mut();
+
+            new.write_offset = AtomicUsize::new(write_offset);
+
+            let new = Arc::new(new);
+
+            // ++ Update old slicebuf with information for the reader.
+
+            // Store .1 first since the reader will always check .0 first.
+            self.shared.next.1.store(old_read_offset, Ordering::Release);
             self.shared
-                .write_offset
-                .store(offset + 1, Ordering::Release);
+                .next
+                .0
+                .store(Arc::into_raw(new.clone()).cast_mut(), Ordering::Release);
+
+            // ++ Update the writers instance to the newly allocated SliceBuf.
+            self.shared = new;
         }
+
+        let mut next_write_addr = unsafe { data_start.add(write_offset) };
+
+        for val in iter {
+            unsafe { next_write_addr.write(val) };
+            next_write_addr = unsafe { next_write_addr.add(1) };
+        }
+
+        self.shared
+            .write_offset
+            .store(write_offset + iter_len, Ordering::Release);
     }
 }
 
@@ -228,6 +291,67 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::SliceBuf;
+
+    /// Macro to compare SliceBufs.
+    ///
+    /// It's a macro so the error messages point to the line where it's used.
+    macro_rules! compare_bufs {
+        ($left:expr, $right:expr) => {
+            let left = $left;
+            let right = $right;
+
+            let SliceBuf {
+                capacity: l_capacity,
+                data_layout: l_data_layout,
+                write_offset: l_write_offset,
+                read_offset: l_read_offset,
+                data_start: l_data_start,
+                next: l_next,
+            } = $left;
+            let SliceBuf {
+                capacity: r_capacity,
+                data_layout: r_data_layout,
+                write_offset: r_write_offset,
+                read_offset: r_read_offset,
+                data_start: r_data_start,
+                next: r_next,
+            } = $right;
+
+            assert_eq!(
+                l_capacity, r_capacity,
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+            assert_eq!(
+                l_data_layout, r_data_layout,
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+            assert_eq!(
+                l_write_offset.load(Ordering::Acquire),
+                r_write_offset.load(Ordering::Acquire),
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+            assert_eq!(
+                l_read_offset.load(Ordering::Acquire),
+                r_read_offset.load(Ordering::Acquire),
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+            assert!(
+                l_data_start.load(Ordering::Acquire).is_null()
+                    == r_data_start.load(Ordering::Acquire).is_null(),
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+            assert!(
+                l_next.0.load(Ordering::Acquire).is_null()
+                    == r_next.0.load(Ordering::Acquire).is_null(),
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+            assert_eq!(
+                l_next.1.load(Ordering::Acquire),
+                r_next.1.load(Ordering::Acquire),
+                "\nleft: {left:#?}\nright: {right:#?}"
+            );
+        };
+    }
 
     #[test]
     #[should_panic(expected = "capacity is 0 but must be at least 1")]
@@ -304,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    pub fn allac_after_full_read() {
+    pub fn alloc_after_full_read() {
         let init_capa = 2;
         let (mut writer, mut reader) = SliceBuf::with_capacity(init_capa).split();
 
@@ -447,5 +571,179 @@ mod tests {
 
         assert_eq!(reader.slice_to(19), None);
         assert_eq!(reader.slice_to(18).unwrap().last(), Some(&19));
+    }
+
+    #[test]
+    fn push_exact_is_the_same_as_push() {
+        let (mut writer, mut reader) = SliceBuf::<usize>::with_capacity(2).split();
+        let (mut exp_writer, mut exp_reader) = SliceBuf::<usize>::with_capacity(2).split();
+
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+
+        let n = 1;
+        writer.push_exact(vec![n]);
+        exp_writer.push(n);
+
+        assert_eq!(reader.slice_to(n), exp_reader.slice_to(n));
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+
+        let n = 2;
+        writer.push_exact(vec![n]);
+        exp_writer.push(n);
+
+        assert_eq!(reader.slice_to(n), exp_reader.slice_to(n));
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+
+        let n = 3;
+        writer.push_exact(vec![n]);
+        exp_writer.push(n);
+
+        assert_eq!(writer.shared.capacity, 4);
+        assert_eq!(reader.slice_to(n), None);
+        assert_eq!(reader.slice_to(n), exp_reader.slice_to(n));
+
+        reader.synchronize();
+        exp_reader.synchronize();
+
+        assert_eq!(reader.slice_to(n).unwrap(), &[1, 2, 3]);
+        assert_eq!(reader.slice_to(n), exp_reader.slice_to(n));
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+
+        let n = 4;
+        writer.push_exact(vec![n]);
+        exp_writer.push(n);
+
+        assert_eq!(writer.shared.capacity, 4);
+        assert_eq!(reader.slice_to(n), exp_reader.slice_to(n));
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+
+        reader.consume(2);
+        exp_reader.consume(2);
+
+        writer.push_exact(vec![5, 6]);
+        exp_writer.push(5);
+        exp_writer.push(6);
+
+        assert_eq!(writer.shared.capacity, 8);
+        assert_eq!(reader.slice_to(4), None);
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+
+        reader.synchronize();
+        exp_reader.synchronize();
+
+        assert_eq!(reader.slice_to(4), exp_reader.slice_to(4));
+        compare_bufs!(writer.shared.as_ref(), exp_writer.shared.as_ref());
+        compare_bufs!(reader.shared.as_ref(), exp_reader.shared.as_ref());
+    }
+
+    #[test]
+    fn push_exact_capacity_growth() {
+        // Start with capacity of 1
+
+        let (mut writer, _) = SliceBuf::with_capacity(1).split();
+        writer.push_exact(0..0);
+        assert_eq!(writer.shared.capacity, 1);
+
+        let (mut writer, _) = SliceBuf::with_capacity(1).split();
+        writer.push_exact(0..1);
+        assert_eq!(writer.shared.capacity, 1);
+
+        let (mut writer, _) = SliceBuf::with_capacity(1).split();
+        writer.push_exact(0..2);
+        assert_eq!(writer.shared.capacity, 2);
+
+        let (mut writer, _) = SliceBuf::with_capacity(1).split();
+        writer.push_exact(0..3);
+        assert_eq!(writer.shared.capacity, 3);
+
+        // Start with capacity of 2
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..0);
+        assert_eq!(writer.shared.capacity, 2);
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..1);
+        assert_eq!(writer.shared.capacity, 2);
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..2);
+        assert_eq!(writer.shared.capacity, 2);
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..3);
+        assert_eq!(writer.shared.capacity, 2 * 2);
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..4);
+        assert_eq!(writer.shared.capacity, 2 * 2);
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..5);
+        assert_eq!(writer.shared.capacity, 5);
+
+        let (mut writer, _) = SliceBuf::with_capacity(2).split();
+        writer.push_exact(0..11);
+        assert_eq!(writer.shared.capacity, 11);
+    }
+
+    #[test]
+    fn push_exact_after_consume() {
+        let basic_setup = || {
+            let (mut writer, mut reader) = SliceBuf::with_capacity(4).split();
+            writer.push_exact(0..3);
+            assert_eq!(writer.shared.capacity, 4);
+
+            reader.consume(2);
+            assert_eq!(reader.slice_to(1).unwrap(), &[2]);
+            writer
+        };
+
+        let mut writer = basic_setup();
+        assert_eq!(writer.shared.capacity, 4);
+        writer.push_exact(0..0);
+        assert_eq!(writer.shared.capacity, 4);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..1);
+        assert_eq!(writer.shared.capacity, 4);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..2); // len = 3
+        assert_eq!(writer.shared.capacity, 8);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..3); // len = 4
+        assert_eq!(writer.shared.capacity, 8);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..4); // len = 5
+        assert_eq!(writer.shared.capacity, 8);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..5); // len = 6
+        assert_eq!(writer.shared.capacity, 8);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..6); // len = 7
+        assert_eq!(writer.shared.capacity, 8);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..7); // len = 8
+        assert_eq!(writer.shared.capacity, 8);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..8); // len = 9
+        assert_eq!(writer.shared.capacity, 9);
+
+        let mut writer = basic_setup();
+        writer.push_exact(0..9); // len = 10
+        assert_eq!(writer.shared.capacity, 10);
     }
 }

@@ -29,7 +29,6 @@ fn single_threaded(c: &mut Criterion) {
 
 fn multi_threaded(c: &mut Criterion) {
     let mut group = c.benchmark_group("multi threaded");
-    group.sample_size(1000);
 
     for n in [1_000, 10_000, 1_000_000] {
         group.bench_with_input(
@@ -152,6 +151,40 @@ fn basic_operations(c: &mut Criterion) {
             criterion::BatchSize::SmallInput,
         )
     });
+    for n in [100, 10_000, 1_000_000] {
+        group.bench_with_input(
+            BenchmarkId::new("push expl_sync::SliceBuf", n),
+            &n,
+            |b, &n| {
+                b.iter_batched(
+                    || {
+                        let (writer, reader) = expl_sync::SliceBuf::with_capacity(n).split();
+                        let input = (0..n).collect::<Vec<_>>();
+                        (writer, reader, input)
+                    },
+                    |(mut writer, _reader, input)| {
+                        writer.push_exact(input);
+                        (writer, _reader)
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("push std::VecDeque", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let deque = VecDeque::with_capacity(n);
+                    let input = (0..n).collect::<Vec<_>>();
+                    (deque, input)
+                },
+                |(mut deque, input)| {
+                    deque.extend(input);
+                    deque
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
+    }
 
     group.finish()
 }

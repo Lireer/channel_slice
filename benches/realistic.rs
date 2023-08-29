@@ -74,9 +74,7 @@ pub fn explicit_sync(samples: &[f32]) {
             scope
                 .spawn(|| {
                     for block in samples.chunks_exact(WRITE_SIZE) {
-                        for &sample in block {
-                            writer.push(sample);
-                        }
+                        writer.push_exact(block.iter().copied());
                     }
                 })
                 .join()
