@@ -168,36 +168,46 @@ pub struct SliceBufWriter<T> {
 
 impl<T> SliceBufWriter<T> {
     pub fn push(&mut self, value: T) {
-        let mut offset = self.shared.write_offset.load(Ordering::Relaxed);
+        let mut data_start = self.shared.data_start.load(Ordering::Relaxed);
+        let mut write_offset = self.shared.write_offset.load(Ordering::Relaxed);
 
-        if offset >= self.shared.capacity {
+        if write_offset >= self.shared.capacity {
             // New allocation is needed.
 
-            // Create a new SliceBuf from the previous instance.
+            // ++ Create a new SliceBuf from the previous instance.
 
-            // TODO: smarter new capacity
-            let mut new = SliceBuf::with_capacity(self.shared.capacity * 2);
-            // Use read_offset from old alloc so the reader can use that during syncronization.
+            // Use read_offset from old alloc, so the reader can use it when
+            // switching to the next alloc.
             let old_read_offset = self.shared.read_offset.load(Ordering::Acquire);
+            // Reduce the write_offset by the number of elements consumed by the
+            // reader, so it's the same as the current number of elements in the
+            // old buffer.
+            write_offset -= old_read_offset;
+
+            let new_capacity = if write_offset + 1 > self.shared.capacity / 2 {
+                // Capacity of new buf should be at least twice the number of
+                // it's initial elements.
+                self.shared.capacity * 2
+            } else {
+                self.shared.capacity
+            };
+            let mut new = SliceBuf::with_capacity(new_capacity);
+
             // Copy data after read_offset to new buffer.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    self.shared
-                        .data_start
-                        .load(Ordering::Relaxed)
-                        .add(old_read_offset),
+                    data_start.add(old_read_offset),
                     *new.data_start.get_mut(),
-                    offset - old_read_offset,
+                    write_offset,
                 )
             };
+            data_start = *new.data_start.get_mut();
 
-            // Reduce the write_offset by the number of elements consumed by the reader.
-            offset -= old_read_offset;
-            new.write_offset = AtomicUsize::new(offset);
+            new.write_offset = AtomicUsize::new(write_offset);
 
             let new = Arc::new(new);
 
-            // Update old slicebuf with information for the reader.
+            // ++ Update old slicebuf with information for the reader.
 
             // Store .1 first since the reader will always check .0 first.
             self.shared.next.1.store(old_read_offset, Ordering::Release);
@@ -207,9 +217,14 @@ impl<T> SliceBufWriter<T> {
                 .store(Arc::into_raw(new.clone()).cast_mut(), Ordering::Release);
 
             // Update the writers instance to the newly allocated SliceBuf.
-
             self.shared = new;
         }
+
+        unsafe { data_start.add(write_offset).write(value) };
+        self.shared
+            .write_offset
+            .store(write_offset + 1, Ordering::Release);
+    }
 
     pub fn push_exact<I>(&mut self, iter: I)
     where
