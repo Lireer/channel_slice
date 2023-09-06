@@ -381,6 +381,81 @@ impl<T> SliceBufWriter<T> {
             .store(write_offset + iter_len, Ordering::Release);
     }
 
+    pub fn push_vec(&mut self, mut vec: Vec<T>) {
+        // TODO: Allow empty vecs. ZSTs might also require special handling.
+        assert_ne!(
+            vec.len(),
+            0,
+            "pushing empty vecs is currently not supported"
+        );
+
+        let vec_len = vec.len();
+
+        let shared = self.shared();
+        let mut data_start = shared.data_start;
+        let mut write_offset = shared.write_offset.load(Ordering::Relaxed);
+
+        // TODO: Maybe panic if the addition results in an overflow or the
+        //       result is bigger than isize::MAX?
+        if write_offset + vec_len > shared.capacity {
+            // Not enough space left in current SliceBuf, a new allocation is
+            // required.
+
+            // ++ Create a new SliceBuf from the previous instance.
+
+            // Use read_offset from old alloc, so it's available for the reader
+            // when switching to the next alloc.
+            let old_read_offset = shared.read_offset.load(Ordering::Acquire);
+            write_offset -= old_read_offset;
+
+            let new_len = write_offset + vec_len;
+            let new_capacity = if new_len > shared.capacity / 2 {
+                // Capacity of new buf should be at least twice the number of
+                // it's initial elements.
+                shared.capacity * 2
+            } else {
+                shared.capacity
+            }
+            .max(new_len); // at least enough for all elements
+            let mut new = SliceBuf::with_capacity(new_capacity);
+
+            // Copy data after read_offset to new buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data_start.add(old_read_offset),
+                    new.data_start,
+                    write_offset,
+                )
+            };
+            data_start = new.data_start;
+
+            new.write_offset = AtomicUsize::new(write_offset);
+
+            let new = Box::leak(Box::new(new));
+
+            // ++ Update old slicebuf with information for the reader.
+
+            // Store .1 first since the reader will always check .0 first.
+            shared.next.1.store(old_read_offset, Ordering::Release);
+            shared.next.0.store(new, Ordering::Release);
+
+            // ++ Update the writers instance to the newly allocated SliceBuf.
+            self.shared = AtomicPtr::new(new);
+        }
+
+        let next_write_addr = unsafe { data_start.add(write_offset) };
+
+        let vec_data = vec.as_ptr();
+        unsafe { std::ptr::copy_nonoverlapping(vec_data, next_write_addr, vec_len) };
+        // SAFETY: Set len of vec to 0, so it won't drop its elements after they have been moved to
+        //         `self.shared`.
+        unsafe { vec.set_len(0) };
+
+        self.shared()
+            .write_offset
+            .store(write_offset + vec_len, Ordering::Release);
+    }
+
     // TODO:
     // pub fn push_within_capacity(&mut self, value: T) -> Result<(), T>
     // pub fn extend_from_slice(&mut self, other: &[T])
