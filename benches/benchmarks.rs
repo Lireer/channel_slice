@@ -57,17 +57,41 @@ fn realistic(c: &mut Criterion) {
     // Create samples
     let seconds = 10;
     let samples_size = seconds * realistic::SAMPLE_RATE;
-    let samples: Vec<f32> = (-1000..1000)
+    let mut samples: Vec<Vec<f32>> = vec![Vec::new()];
+
+    (-1000..1000)
         .map(|s| s as f32 / 1000.0)
         .cycle()
         .take(samples_size)
-        .collect();
+        .for_each(|sample| {
+            if samples.last().unwrap().len() < realistic::WRITE_SIZE {
+                samples.last_mut().unwrap().push(sample);
+            } else {
+                let mut new_vec = Vec::with_capacity(realistic::WRITE_SIZE);
+                new_vec.push(sample);
+                samples.push(new_vec);
+            }
+        });
 
     group.bench_function("Mutex<std::VecDeque>", |b| {
-        b.iter(|| realistic::std_vecdeque(black_box(&samples)))
+        b.iter_batched(
+            || samples.clone(),
+            |mut samples| {
+                realistic::std_vecdeque(&mut samples);
+                samples
+            },
+            criterion::BatchSize::SmallInput,
+        )
     });
     group.bench_function("explicit sync", |b| {
-        b.iter(|| realistic::explicit_sync(black_box(&samples)))
+        b.iter_batched(
+            || samples.clone(),
+            |mut samples| {
+                realistic::explicit_sync(&mut samples);
+                samples
+            },
+            criterion::BatchSize::SmallInput,
+        )
     });
 
     group.finish();

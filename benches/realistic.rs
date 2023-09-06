@@ -10,10 +10,10 @@ use slicebuf::expl_sync;
 
 pub const SAMPLE_RATE: usize = 16000;
 const INITIAL_BUFFER_SIZE: usize = SAMPLE_RATE / 2;
-const WRITE_SIZE: usize = SAMPLE_RATE / 25;
+pub const WRITE_SIZE: usize = SAMPLE_RATE / 25;
 const READ_SIZE: usize = 1600;
 
-pub fn std_vecdeque(samples: &[f32]) {
+pub fn std_vecdeque(samples: &mut Vec<Vec<f32>>) {
     let buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(
         INITIAL_BUFFER_SIZE,
     )));
@@ -37,7 +37,7 @@ pub fn std_vecdeque(samples: &[f32]) {
         |scope| {
             scope
                 .spawn(|| {
-                    for block in samples.chunks_exact(WRITE_SIZE) {
+                    while let Some(block) = samples.pop() {
                         buf.lock().extend(block);
                     }
                 })
@@ -49,7 +49,7 @@ pub fn std_vecdeque(samples: &[f32]) {
     reader_handle.join().unwrap();
 }
 
-pub fn explicit_sync(samples: &[f32]) {
+pub fn explicit_sync(samples: &mut Vec<Vec<f32>>) {
     let (mut writer, mut reader) =
         expl_sync::SliceBuf::<f32>::with_capacity(INITIAL_BUFFER_SIZE).split();
 
@@ -73,8 +73,8 @@ pub fn explicit_sync(samples: &[f32]) {
         |scope| {
             scope
                 .spawn(|| {
-                    for block in samples.chunks_exact(WRITE_SIZE) {
-                        writer.push_exact(block.iter().copied());
+                    while let Some(block) = samples.pop() {
+                        writer.push_vec(block);
                     }
                 })
                 .join()
