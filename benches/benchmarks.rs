@@ -4,7 +4,9 @@ mod single_threaded;
 
 use std::collections::VecDeque;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration,
+};
 use slicebuf::expl_sync;
 
 fn single_threaded(c: &mut Criterion) {
@@ -52,14 +54,17 @@ fn multi_threaded(c: &mut Criterion) {
 
 fn realistic(c: &mut Criterion) {
     let mut group = c.benchmark_group("realistic");
-    group.sample_size(1000);
+    // group.sample_size(1000);
 
     // Create samples
     let seconds = 10;
     let samples_size = seconds * realistic::SAMPLE_RATE;
     let mut samples: Vec<Vec<f32>> = vec![Vec::new()];
 
-    (-1000..1000)
+    let base_range = -1000..1000;
+    base_range
+        .clone()
+        .chain(base_range.rev())
         .map(|s| s as f32 / 1000.0)
         .cycle()
         .take(samples_size)
@@ -72,6 +77,8 @@ fn realistic(c: &mut Criterion) {
                 samples.push(new_vec);
             }
         });
+
+    // Reads don't do any actual work. They just drain the buffer.
 
     group.bench_function("Mutex<std::VecDeque>", |b| {
         b.iter_batched(
@@ -88,6 +95,29 @@ fn realistic(c: &mut Criterion) {
             || samples.clone(),
             |mut samples| {
                 realistic::explicit_sync(&mut samples);
+                samples
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+
+    // Read bytes are actually processed, which should increase the time spent on the read thread.
+
+    group.bench_function("Mutex<std::VecDeque> simulate work", |b| {
+        b.iter_batched(
+            || samples.clone(),
+            |mut samples| {
+                realistic::std_vecdeque_do_work(&mut samples);
+                samples
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("explicit sync simulate work", |b| {
+        b.iter_batched(
+            || samples.clone(),
+            |mut samples| {
+                realistic::explicit_sync_do_work(&mut samples);
                 samples
             },
             criterion::BatchSize::SmallInput,
@@ -175,6 +205,15 @@ fn basic_operations(c: &mut Criterion) {
             criterion::BatchSize::SmallInput,
         )
     });
+
+    group.finish();
+}
+
+fn push_multiple(c: &mut Criterion) {
+    let plot_config = PlotConfiguration::default().summary_scale(criterion::AxisScale::Logarithmic);
+    let mut group = c.benchmark_group("push multiple");
+    group.plot_config(plot_config);
+
     for n in [100, 10_000, 1_000_000] {
         group.bench_with_input(
             BenchmarkId::new("push expl_sync::SliceBuf", n),
@@ -216,6 +255,7 @@ fn basic_operations(c: &mut Criterion) {
 criterion_group!(
     benches,
     basic_operations,
+    push_multiple,
     single_threaded,
     multi_threaded,
     realistic
