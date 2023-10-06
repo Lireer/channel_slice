@@ -326,47 +326,8 @@ impl<T> SliceBufWriter<T> {
         if write_offset + iter_len > shared.capacity {
             // Not enough space left in current SliceBuf, a new allocation is
             // required.
-
-            // ++ Create a new SliceBuf from the previous instance.
-
-            // Use read_offset from old alloc, so it's available for the reader
-            // when switching to the next alloc.
-            let old_read_offset = shared.read_offset.load(Ordering::Acquire);
-            write_offset -= old_read_offset;
-
-            let new_len = write_offset + iter_len;
-            let new_capacity = if new_len > shared.capacity / 2 {
-                // Capacity of new buf should be at least twice the number of
-                // it's initial elements.
-                shared.capacity * 2
-            } else {
-                shared.capacity
-            }
-            .max(new_len); // at least enough for all elements
-            let mut new = SliceBuf::with_capacity(new_capacity);
-
-            // Copy data after read_offset to new buffer.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data_start.add(old_read_offset),
-                    new.data_start,
-                    write_offset,
-                )
-            };
-            data_start = new.data_start;
-
-            new.write_offset = AtomicUsize::new(write_offset);
-
-            let new = Box::leak(Box::new(new));
-
-            // ++ Update old slicebuf with information for the reader.
-
-            // Store .1 first since the reader will always check .0 first.
-            shared.next.1.store(old_read_offset, Ordering::Release);
-            shared.next.0.store(new, Ordering::Release);
-
-            // ++ Update the writers instance to the newly allocated SliceBuf.
-            self.shared = AtomicPtr::new(new);
+            self.shared =
+                self.alloc_new_slice_buf(shared, &mut data_start, &mut write_offset, iter_len);
         }
 
         let mut next_write_addr = unsafe { data_start.add(write_offset) };
@@ -400,47 +361,8 @@ impl<T> SliceBufWriter<T> {
         if write_offset + vec_len > shared.capacity {
             // Not enough space left in current SliceBuf, a new allocation is
             // required.
-
-            // ++ Create a new SliceBuf from the previous instance.
-
-            // Use read_offset from old alloc, so it's available for the reader
-            // when switching to the next alloc.
-            let old_read_offset = shared.read_offset.load(Ordering::Acquire);
-            write_offset -= old_read_offset;
-
-            let new_len = write_offset + vec_len;
-            let new_capacity = if new_len > shared.capacity / 2 {
-                // Capacity of new buf should be at least twice the number of
-                // it's initial elements.
-                shared.capacity * 2
-            } else {
-                shared.capacity
-            }
-            .max(new_len); // at least enough for all elements
-            let mut new = SliceBuf::with_capacity(new_capacity);
-
-            // Copy data after read_offset to new buffer.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data_start.add(old_read_offset),
-                    new.data_start,
-                    write_offset,
-                )
-            };
-            data_start = new.data_start;
-
-            new.write_offset = AtomicUsize::new(write_offset);
-
-            let new = Box::leak(Box::new(new));
-
-            // ++ Update old slicebuf with information for the reader.
-
-            // Store .1 first since the reader will always check .0 first.
-            shared.next.1.store(old_read_offset, Ordering::Release);
-            shared.next.0.store(new, Ordering::Release);
-
-            // ++ Update the writers instance to the newly allocated SliceBuf.
-            self.shared = AtomicPtr::new(new);
+            self.shared =
+                self.alloc_new_slice_buf(shared, &mut data_start, &mut write_offset, vec_len);
         }
 
         let next_write_addr = unsafe { data_start.add(write_offset) };
@@ -454,6 +376,57 @@ impl<T> SliceBufWriter<T> {
         self.shared()
             .write_offset
             .store(write_offset + vec_len, Ordering::Release);
+    }
+
+    /// Creates a new SliceBuf from the previous instance and returns a pointer to it.
+    ///
+    /// The parameters `data_start` and `write_offset` are updated to refer to the new instance, this avoids at least
+    /// one atomic load, maybe even two.
+    fn alloc_new_slice_buf(
+        &self,
+        shared: &SliceBuf<T>,
+        data_start: &mut *mut T,
+        write_offset: &mut usize,
+        new_count: usize,
+    ) -> AtomicPtr<SliceBuf<T>> {
+        // Use read_offset from old alloc, so it's available for the reader
+        // when switching to the next alloc.
+        let old_read_offset = shared.read_offset.load(Ordering::Acquire);
+        *write_offset -= old_read_offset;
+
+        let new_len = *write_offset + new_count;
+        let new_capacity = if new_len > shared.capacity / 2 {
+            // Capacity of new buf should be at least twice the number of
+            // it's initial elements.
+            shared.capacity * 2
+        } else {
+            shared.capacity
+        }
+        .max(new_len); // at least enough for all elements
+        let mut new = SliceBuf::with_capacity(new_capacity);
+
+        // Copy data after read_offset to new buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data_start.add(old_read_offset),
+                new.data_start,
+                *write_offset,
+            )
+        };
+        *data_start = new.data_start;
+
+        new.write_offset = AtomicUsize::new(*write_offset);
+
+        let new = Box::leak(Box::new(new));
+
+        // ++ Update old slicebuf with information for the reader.
+
+        // Store .1 first since the reader will always check .0 first.
+        shared.next.1.store(old_read_offset, Ordering::Release);
+        shared.next.0.store(new, Ordering::Release);
+
+        // Return the pointer to the newly allocated SliceBuf so `self.shared` can be updated.
+        AtomicPtr::new(new)
     }
 
     // TODO:
