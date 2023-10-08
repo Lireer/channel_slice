@@ -28,7 +28,6 @@ impl<T> SliceBuf<T> {
     // }
 
     pub fn remaining_capacity(&self) -> usize {
-        // TOOD: Handle multiple allocations and potential data races.
         self.capacity - self.write_offset.load(Ordering::Relaxed)
     }
 
@@ -43,7 +42,7 @@ impl<T> SliceBuf<T> {
         );
 
         let data_layout = Layout::from_size_align(size_of_t * capacity, align_of_t).unwrap();
-        let data_start = unsafe { std::alloc::alloc(data_layout) };
+        let data_start = dbg!(unsafe { std::alloc::alloc(data_layout) });
         if data_start.is_null() {
             // Abort if allocation failed, see `alloc` function for more information.
             std::alloc::handle_alloc_error(data_layout);
@@ -62,14 +61,14 @@ impl<T> SliceBuf<T> {
 
     pub fn split(self) -> (SliceBufWriter<T>, SliceBufReader<T>) {
         let shared = Box::into_raw(Box::new(self));
-        (
+        dbg!((
             SliceBufWriter {
                 shared: AtomicPtr::new(shared),
             },
             SliceBufReader {
                 shared: AtomicPtr::new(shared),
             },
-        )
+        ))
     }
 }
 
@@ -86,6 +85,7 @@ impl<T> Drop for SliceBuf<T> {
         // TODO: Drop elements between read_offset and write_offset
 
         // Deallocate the memory used for this buffer.
+        dbg!(format!("dealloc {:?}", self.data_start));
         unsafe { std::alloc::dealloc(self.data_start.cast(), self.data_layout) }
 
         // If a next allocation exists, try to drop that too.
@@ -107,6 +107,7 @@ impl<T> Drop for SliceBuf<T> {
 
 impl<T> Drop for SliceBufReader<T> {
     fn drop(&mut self) {
+        dbg!("drop reader");
         // Check if this is the last remaining reference to `self.shared`.
         if self
             .shared()
@@ -115,7 +116,7 @@ impl<T> Drop for SliceBufReader<T> {
         {
             // referenced_twice was still true, so another reference to this SliceBuf
             // still exists -> there's nothing to do here. The actual drop will
-            // be performed the next time drop is called.
+            // be performed the next time `self.shared`'s drop is called.
             return;
         }
 
@@ -123,6 +124,7 @@ impl<T> Drop for SliceBufReader<T> {
         // TODO: Why? Look at Arc<T>::drop
         std::sync::atomic::fence(Ordering::Acquire);
         // SAFETY: This is safe because self.shared is confirmed to be a unique pointer at this point
+        dbg!(format!("actual drop from reader {:?}", self));
         drop(unsafe { Box::from_raw(*self.shared.get_mut()) });
     }
 }
@@ -137,7 +139,7 @@ impl<T> Drop for SliceBufWriter<T> {
         {
             // referenced_twice was still true, so another reference to this SliceBuf
             // still exists -> there's nothing to do here. The actual drop will
-            // be performed the next time drop is called.
+            // be performed the next time `self.shared`'s drop is called.
             return;
         }
 
@@ -152,10 +154,26 @@ impl<T> Drop for SliceBufWriter<T> {
 unsafe impl<T: Sync + Send> Sync for SliceBuf<T> {}
 unsafe impl<T: Sync + Send> Send for SliceBuf<T> {}
 
-#[derive(Debug)]
+impl<T> std::fmt::Debug for SliceBufReader<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SliceBufWriter")
+            .field("shared", &self.shared)
+            .finish()
+    }
+}
+
+impl<T> std::fmt::Debug for SliceBufWriter<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SliceBufWriter")
+            .field("shared", &self.shared)
+            .finish()
+    }
+}
+
 pub struct SliceBufReader<T> {
     // TODO: Should this actually be:
     // shared: AtomicPtr<ManuallyDrop<SliceBuf<T>>>,
+    // This is an AtomicPtr instead of a raw pointer, since those aren't Send + Sync. It's guaranteed to be unique
     shared: AtomicPtr<SliceBuf<T>>,
 }
 
@@ -223,23 +241,34 @@ impl<T> SliceBufReader<T> {
     /// allocation currently used by the reader, even if more elements have been
     /// written into a new allocation by the corresponding [`SliceBufWriter`].
     pub fn consume(&mut self, n: usize) {
-        // TODO: How should this behave if multiple allocations exist?
-        // TODO: Maybe change ordering if writer also accesses read_offset.
-
-        let old_val = self.shared().read_offset.fetch_add(n, Ordering::Release);
+        // TODO: Maybe change ordering considering the writer also accesses
+        // read_offset.
+        let shared = self.shared();
+        let old_offset = self.shared().read_offset.fetch_add(n, Ordering::Release);
 
         let write_offset = self.shared().write_offset.load(Ordering::Acquire);
-        if old_val + n > write_offset {
+        if old_offset + n > write_offset {
             panic!(
                 "old_val + n is greater than self.shared.write_offset: {} > {}",
-                dbg!(old_val) + dbg!(n),
+                dbg!(old_offset) + dbg!(n),
                 write_offset
             );
+        }
+
+        if std::mem::needs_drop::<T>() {
+            // Drop `n` values starting from the previous read_offset.
+
+            let elem_size = std::mem::size_of::<T>();
+
+            // SAFETY: These values are valid, else the panic would been triggered.
+            for elem_offset in (0..n).map(|o| o * elem_size) {
+                let to_drop = unsafe { shared.data_start.add(old_offset + elem_offset) };
+                unsafe { std::ptr::drop_in_place(to_drop) }
+            }
         }
     }
 }
 
-#[derive(Debug)]
 pub struct SliceBufWriter<T> {
     // TODO: Should this actually be:
     // shared: AtomicPtr<ManuallyDrop<SliceBuf<T>>>,
@@ -301,6 +330,7 @@ impl<T> SliceBufWriter<T> {
 
             // Update the writers instance to the newly allocated SliceBuf.
             self.shared = AtomicPtr::new(new);
+            dbg!(&self);
         }
 
         unsafe { data_start.add(write_offset).write(value) };
@@ -328,6 +358,8 @@ impl<T> SliceBufWriter<T> {
             // required.
             self.shared =
                 self.alloc_new_slice_buf(shared, &mut data_start, &mut write_offset, iter_len);
+
+            dbg!(&self);
         }
 
         let mut next_write_addr = unsafe { data_start.add(write_offset) };
@@ -363,6 +395,7 @@ impl<T> SliceBufWriter<T> {
             // required.
             self.shared =
                 self.alloc_new_slice_buf(shared, &mut data_start, &mut write_offset, vec_len);
+            dbg!(&self);
         }
 
         let next_write_addr = unsafe { data_start.add(write_offset) };
