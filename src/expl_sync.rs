@@ -4,6 +4,12 @@ use std::{
 };
 
 /// Only for types for which `mem::needs_drop` returns false.
+///
+/// # Drop
+///
+/// Every [`SliceBuf`] allocates a block of contiguous memory that has to be deallocated. The
+/// elements stored in and owned by the entirety of the `SliceBuf` linked-list have to be dropped
+/// exactly once, if [`std::mem::needs_drop<T>`] is `true` and ownership hasn't been transferred.
 #[derive(Debug)]
 pub struct SliceBuf<T> {
     referenced_twice: AtomicBool,
@@ -80,6 +86,7 @@ impl<T> Default for SliceBuf<T> {
 
 impl<T> Drop for SliceBuf<T> {
     fn drop(&mut self) {
+        dbg!("drop shared", self as *mut _);
         assert!(!std::mem::needs_drop::<T>());
 
         // TODO: Drop elements between read_offset and write_offset
@@ -90,7 +97,7 @@ impl<T> Drop for SliceBuf<T> {
 
         // If a next allocation exists, try to drop that too.
         let next_ptr = self.next.0.swap(std::ptr::null_mut(), Ordering::Acquire);
-        if !next_ptr.is_null() {
+        if dbg!(!next_ptr.is_null()) {
             let next = unsafe { &*next_ptr };
             if next.referenced_twice.swap(false, Ordering::Release) {
                 // referenced_twice was true, which means the other component still has a reference
@@ -107,12 +114,12 @@ impl<T> Drop for SliceBuf<T> {
 
 impl<T> Drop for SliceBufReader<T> {
     fn drop(&mut self) {
-        dbg!("drop reader");
+        dbg!("drop reader", &self.shared);
         // Check if this is the last remaining reference to `self.shared`.
-        if self
+        if dbg!(self
             .shared()
             .referenced_twice
-            .swap(false, Ordering::Release)
+            .swap(false, Ordering::Release))
         {
             // referenced_twice was still true, so another reference to this SliceBuf
             // still exists -> there's nothing to do here. The actual drop will
@@ -131,11 +138,12 @@ impl<T> Drop for SliceBufReader<T> {
 
 impl<T> Drop for SliceBufWriter<T> {
     fn drop(&mut self) {
+        dbg!("drop writer", &self.shared);
         // Check if this is the last remaining reference to `self.shared`.
-        if self
+        if dbg!(self
             .shared()
             .referenced_twice
-            .swap(false, Ordering::Release)
+            .swap(false, Ordering::Release))
         {
             // referenced_twice was still true, so another reference to this SliceBuf
             // still exists -> there's nothing to do here. The actual drop will
@@ -173,7 +181,7 @@ impl<T> std::fmt::Debug for SliceBufWriter<T> {
 pub struct SliceBufReader<T> {
     // TODO: Should this actually be:
     // shared: AtomicPtr<ManuallyDrop<SliceBuf<T>>>,
-    // This is an AtomicPtr instead of a raw pointer, since those aren't Send + Sync. It's guaranteed to be unique
+    // This is an AtomicPtr instead of a raw pointer, since those aren't Send + Sync. It's guaranteed to be unique.
     shared: AtomicPtr<SliceBuf<T>>,
 }
 
@@ -241,7 +249,7 @@ impl<T> SliceBufReader<T> {
     /// allocation currently used by the reader, even if more elements have been
     /// written into a new allocation by the corresponding [`SliceBufWriter`].
     pub fn consume(&mut self, n: usize) {
-        // TODO: Maybe change ordering considering the writer also accesses
+        // TODO: Maybe change ordering because the writer also accesses
         // read_offset.
         let shared = self.shared();
         let old_offset = self.shared().read_offset.fetch_add(n, Ordering::Release);
@@ -766,6 +774,39 @@ mod tests {
 
         assert_eq!(reader.slice_to(19), None);
         assert_eq!(reader.slice_to(18).unwrap().last(), Some(&19));
+    }
+
+    #[test]
+    fn drop_check() {
+        let capa = 2;
+        let len = 4;
+        let buf = SliceBuf::with_capacity(capa);
+        let (mut writer, mut reader) = buf.split();
+
+        for i in 0..len {
+            writer.push(i);
+        }
+
+        assert_eq!(reader.shared().write_offset.load(Ordering::SeqCst), 2);
+
+        reader.consume(2);
+
+        drop(writer);
+
+        assert_ne!(
+            reader.shared().next.0.load(Ordering::SeqCst),
+            std::ptr::null_mut()
+        );
+
+        // reader.synchronize();
+
+        // assert_eq!(
+        //     reader.shared().next.0.load(Ordering::SeqCst),
+        //     std::ptr::null_mut()
+        // );
+
+        // assert_eq!(reader.slice_to(19), None);
+        // assert_eq!(reader.slice_to(18).unwrap().last(), Some(&19));
     }
 
     #[test]
