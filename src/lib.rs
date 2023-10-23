@@ -1,3 +1,4 @@
+pub mod bounded;
 pub mod expl_sync;
 
 pub trait SliceBufRead<T> {
