@@ -1,13 +1,18 @@
 use std::{
     alloc::Layout,
+    mem,
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
         Arc,
     },
 };
 
+fn get_buffer_layout<T>(capacity: usize) -> Layout {
+    Layout::from_size_align(2 * capacity * mem::size_of::<T>(), mem::align_of::<T>()).unwrap()
+}
+
 pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let size_of_t = std::mem::size_of::<T>();
+    let size_of_t = mem::size_of::<T>();
     assert_ne!(capacity, 0, "capacity is 0 but must be at least 1");
     assert_ne!(size_of_t, 0, "zero sized types are currenty not supported");
     assert!(
@@ -15,8 +20,7 @@ pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         "types that need to be dropped are currently not supported"
     );
 
-    let data_layout =
-        Layout::from_size_align(2 * capacity * size_of_t, std::mem::align_of::<T>()).unwrap();
+    let data_layout = get_buffer_layout::<T>(capacity);
     let data_start: *mut T = unsafe { std::alloc::alloc(data_layout) }.cast();
     if data_start.is_null() {
         // Abort if allocation failed, see `alloc` function for more information.
@@ -27,8 +31,9 @@ pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         data_ptr: data_start,
         len: AtomicUsize::new(0),
         capacity,
-        head: AtomicPtr::new(data_start),
         tail: AtomicPtr::new(data_start),
+        head: AtomicPtr::new(data_start),
+        space_left_by_head: AtomicUsize::new(0),
     });
 
     (
@@ -54,15 +59,22 @@ pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 #[derive(Debug)]
 struct ChannelData<T> {
     data_ptr: *const T,
+    capacity: usize,
     /// The number of elements currently in the channel.
     ///
     /// This is also the main way of synchonizing between `Sender` and `Receiver`.
     len: AtomicUsize,
-    capacity: usize,
-    // Position of the sender, it points to the last written element.
-    head: AtomicPtr<T>,
-    // Position of the receiver, it points to the next readable element if the channel isn't empty.
+    /// Position of the receiver, it points to the next readable element if the channel isn't empty.
     tail: AtomicPtr<T>,
+    /// Position of the sender, it points to the last written element.
+    head: AtomicPtr<T>,
+    /// The memory in number of elements left empty when switching the head to the other half.
+    ///
+    /// This is the length at the time of the switch, i.e. the maximum number of elements the reader
+    /// could copy after the switch.
+    // Bikeshed name: space_left_by_head, head_write_offset, len_at_head_switch, len_at_switch
+    //                write_start_in_half, write_start_after_switch
+    space_left_by_head: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -86,6 +98,13 @@ impl<T> ChannelData<T> {
     }
 }
 
+impl<T> Drop for ChannelData<T> {
+    fn drop(&mut self) {
+        let layout = get_buffer_layout::<T>(self.capacity);
+        unsafe { std::alloc::dealloc(self.data_ptr as *mut u8, layout) };
+    }
+}
+
 impl<T> Sender<T> {
     pub fn push(&mut self, value: T) {
         // Acquire ordering to make sure we get the correct number of elements.
@@ -99,9 +118,11 @@ impl<T> Sender<T> {
         head = unsafe { head.add(1) };
 
         if head.cast_const() >= self.current_half_end {
-            dbg!("at end of half");
             // next element has to be written into the second half.
-            head = self.switch(len);
+
+            // Update `space_left_by_head` using `Relaxed` ordering because the receiver may only
+            // read it after `len` has been updated which only happens at the end and uses `AcqRel`.
+            head = self.switch(len, Ordering::Relaxed);
         }
 
         // Write the value and update head to point to it.
@@ -112,12 +133,23 @@ impl<T> Sender<T> {
         self.buf.len.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn switch(&mut self, len: usize) -> *mut T {
-        if self.current_half_end == self.buf.half_point() {
-            self.current_half_end = unsafe { self.buf.half_point().add(self.buf.capacity) };
+    /// Switch the head to the other half, leaving `len` elements of space at the start of the half.
+    ///
+    /// Updates `buf.space_left_by_head` to `len`.
+    fn switch(&mut self, len: usize, order: Ordering) -> *mut T {
+        let buf = &self.buf;
+        if self.current_half_end == buf.half_point() {
+            // Currently in the first half, switch to the second.
+            self.current_half_end = unsafe { buf.half_point().add(buf.capacity) };
         } else {
-            self.current_half_end = self.buf.half_point();
+            // Currently in the second half, switch to the first.
+            self.current_half_end = buf.half_point();
         }
-        unsafe { self.current_half_end.sub(len) }.cast_mut()
+
+        // Leave `len` elements empty before the next element, so the reader could potentially copy
+        // all elements to this half.
+        let new_head = unsafe { self.current_half_end.sub(buf.capacity - len) }.cast_mut();
+        self.buf.space_left_by_head.store(len, order);
+        new_head
     }
 }
