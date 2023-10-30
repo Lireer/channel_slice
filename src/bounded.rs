@@ -177,9 +177,7 @@ impl<T> Receiver<T> {
 
         // Check if we can get `n` elements from the current half, if not switch to the other half
         // which should then contain enough elements.
-        let elems_in_half = unsafe { self.current_half_end.offset_from(self.tail) };
-        debug_assert!(elems_in_half >= 0);
-        let elems_in_half = elems_in_half as usize;
+        let elems_in_half = self.offset_from_half_end();
 
         if n > elems_in_half {
             // Copy to other half and update tail accordingly.
@@ -187,6 +185,11 @@ impl<T> Receiver<T> {
         }
 
         Some(unsafe { std::slice::from_raw_parts(self.tail, n) })
+    }
+
+    fn offset_from_half_end(&self) -> usize {
+        assert!(self.current_half_end >= self.tail);
+        unsafe { self.current_half_end.offset_from(self.tail) as usize }
     }
 
     fn switch(&mut self, elems_in_half: usize) -> *mut T {
@@ -198,6 +201,18 @@ impl<T> Receiver<T> {
             unsafe { self.buf.data_ptr.add(space_left_by_head - elems_in_half) }.cast_mut();
         unsafe { std::ptr::copy_nonoverlapping(self.tail, new_tail, elems_in_half) };
         new_tail
+    }
+}
+
+impl Sender<f32> {
+    #[inline(never)]
+    pub fn push_f32(&mut self, val: f32) {
+        self.push(val)
+    }
+
+    #[inline(never)]
+    pub fn switch_f32(&mut self, len: usize) -> *mut f32 {
+        self.switch(len, Ordering::Relaxed)
     }
 }
 
