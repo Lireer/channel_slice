@@ -7,6 +7,23 @@ use std::{
     },
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecvError {
+    /// Returned by [`Receiver::try_*`][Receiver::try_recv] methods in cases in which their non-try
+    /// counterpart would block.
+    ///
+    /// Contains the current number of elements in the channel.
+    WouldBlock(usize),
+    OutOfBounds,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError<T> {
+    Full(T),
+    Disconnected(T),
+}
+
 fn get_buffer_layout<T>(capacity: usize) -> Layout {
     Layout::from_size_align(2 * capacity * mem::size_of::<T>(), mem::align_of::<T>()).unwrap()
 }
@@ -118,6 +135,12 @@ impl<T> ChannelData<T> {
 unsafe impl<T> Send for ChannelData<T> where T: Send {}
 unsafe impl<T> Sync for ChannelData<T> where T: Sync {}
 
+unsafe impl<T> Send for Sender<T> where T: Send {}
+unsafe impl<T> Sync for Sender<T> where T: Sync {}
+
+unsafe impl<T> Send for Receiver<T> where T: Send {}
+unsafe impl<T> Sync for Receiver<T> where T: Sync {}
+
 impl<T> Drop for ChannelData<T> {
     fn drop(&mut self) {
         let layout = get_buffer_layout::<T>(self.capacity);
@@ -126,35 +149,52 @@ impl<T> Drop for ChannelData<T> {
 }
 
 impl<T> Sender<T> {
-    pub fn push(&mut self, value: T) {
+    /// Returns the current number of elements in the channel.
+    pub fn len(&self) -> usize {
         // Acquire ordering to make sure we get the correct number of elements.
-        let len = self.buf.len.load(Ordering::Acquire);
+        self.buf.len.load(Ordering::Acquire)
+    }
+
+    /// Returns whether the channel is currently empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the total number of elements the channel can hold at a time.
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity
+    }
+
+    /// Sends a value on this channel, blocking if the channel is full.
+    pub fn send(&mut self, t: T) -> Result<(), SendError<T>> {
+        // TODO: Check if the receiver has disconnected and return SendError::Disconnected, if so.
+        let len = self.len();
         if len >= self.buf.capacity {
-            todo!("handle blocking when pushing and capacity has been reached");
+            todo!("Impl blocking send");
         }
 
-        // Relaxed ordering since `head` is only accessed by `self`.
-        let mut head = self.head;
+        // SAFETY: We just checked, that at `len` is lower than the allowed capacity.
+        unsafe { self.send_unchecked(t, len) };
+        Ok(())
+    }
 
-        if head.cast_const() >= self.current_half_end {
-            // next element has to be written into the second half.
-
-            // Update `space_left_by_head` using `Relaxed` ordering because the receiver may only
-            // read it after `len` has been updated which only happens at the end and uses `AcqRel`.
-            head = self.switch(len, Ordering::Relaxed);
+    /// Attempts to send a value on this channel
+    pub fn try_send(&mut self, t: T) -> Result<(), SendError<T>> {
+        // TODO: Check if the receiver has disconnected and return SendError::Disconnected, if so.
+        let len = self.len();
+        if len >= self.buf.capacity {
+            return Err(SendError::Full(t));
         }
 
-        // Write the value and update head to point to the next element.
-        unsafe { head.write(value) };
-        self.head = unsafe { head.add(1) };
-
-        // TODO: Could this be Release instead?
-        self.buf.len.fetch_add(1, Ordering::AcqRel);
+        // SAFETY: We just checked, that at `len` is lower than the allowed capacity.
+        unsafe { self.send_unchecked(t, len) };
+        Ok(())
     }
 
     /// Switch the head to the other half, leaving `len` elements of space at the start of the half.
     ///
-    /// Updates `buf.space_left_by_head` to `len`.
+    /// Updates `buf.space_left_by_head` to `len`, for which the [`store`][AtomicUsize::store] uses
+    /// `order`.
     fn switch(&mut self, len: usize, order: Ordering) -> *mut T {
         let buf = &self.buf;
 
@@ -166,13 +206,54 @@ impl<T> Sender<T> {
         self.buf.space_left_by_head.store(len, order);
         new_head
     }
+
+    /// Send a value into the channel without checking if `len + 1` would be bigger than the capacity.
+    ///
+    /// The `len` argument is required to avoid calling `self.len` twice.
+    unsafe fn send_unchecked(&mut self, t: T, len: usize) {
+        if self.head.cast_const() >= self.current_half_end {
+            // element has to be written into the other half.
+
+            // Update `space_left_by_head` using `Relaxed` ordering because the receiver may only
+            // read it after `len` has been updated which only happens at the end and uses `AcqRel`.
+            // TODO: Check if this is actually enough given the weak guarantees around Relaxed
+            // ordering, i.e. what about reordering of statements on the same thread?
+            self.head = self.switch(len, Ordering::Relaxed);
+        }
+
+        // Write the value and update head to point to the next element.
+        unsafe { self.head.write(t) };
+        self.head = unsafe { self.head.add(1) };
+
+        // TODO: Could this be Release instead?
+        self.buf.len.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl<T> Receiver<T> {
-    pub fn peek(&mut self, n: usize) -> Option<&[T]> {
+    /// Returns the current number of elements in the channel.
+    pub fn len(&self) -> usize {
+        // Acquire ordering to make sure we get the correct number of elements.
+        self.buf.len.load(Ordering::Acquire)
+    }
+
+    /// Returns whether the channel is currently empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the total number of elements the channel can hold at a time.
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity
+    }
+
+    pub fn try_peek(&mut self, n: usize) -> Result<&[T], RecvError> {
+        if n > self.capacity() {
+            return Err(RecvError::OutOfBounds);
+        }
         let len = self.buf.len.load(Ordering::Acquire);
         if len < n {
-            return None;
+            return Err(RecvError::WouldBlock(len));
         }
 
         // Check if we can get `n` elements from the current half, if not switch to the other half
@@ -184,7 +265,24 @@ impl<T> Receiver<T> {
             self.tail = self.switch(elems_in_half);
         }
 
-        Some(unsafe { std::slice::from_raw_parts(self.tail, n) })
+        Ok(unsafe { std::slice::from_raw_parts(self.tail, n) })
+    }
+
+    pub fn peek(&mut self, n: usize) -> Result<&[T], RecvError> {
+        todo!()
+    }
+
+    pub fn try_recv(&mut self) -> Result<T, RecvError> {
+        todo!()
+    }
+
+    pub fn recv(&mut self) -> Result<T, RecvError> {
+        todo!()
+    }
+
+    /// Removes `n` elements from the queue, dropping them if required.
+    pub fn deque(&mut self, n: usize) -> Result<(), RecvError> {
+        todo!()
     }
 
     fn offset_from_half_end(&self) -> usize {
@@ -201,31 +299,5 @@ impl<T> Receiver<T> {
             unsafe { self.buf.data_ptr.add(space_left_by_head - elems_in_half) }.cast_mut();
         unsafe { std::ptr::copy_nonoverlapping(self.tail, new_tail, elems_in_half) };
         new_tail
-    }
-}
-
-impl Sender<f32> {
-    #[inline(never)]
-    pub fn push_f32(&mut self, val: f32) {
-        self.push(val)
-    }
-
-    #[inline(never)]
-    pub fn switch_f32(&mut self, len: usize) -> *mut f32 {
-        self.switch(len, Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::create_bounded;
-
-    #[test]
-    fn send_elements() {
-        let (mut s, mut r) = create_bounded(3);
-        for i in 0..3 {
-            s.push(i);
-        }
-        assert_eq!(Some(vec![0, 1, 2].as_slice()), r.peek(3));
     }
 }
