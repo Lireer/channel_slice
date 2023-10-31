@@ -301,3 +301,76 @@ impl<T> Receiver<T> {
         new_tail
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::bounded::{create_bounded, SendError};
+
+    #[test]
+    #[should_panic(expected = "capacity is 0 but must be at least 1")]
+    fn empty_channel() {
+        create_bounded::<u32>(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "types that need to be dropped are currently not supported")]
+    fn droppable_type_channel() {
+        create_bounded::<String>(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "zero sized types are currenty not supported")]
+    fn zst_channel() {
+        struct Zst;
+        create_bounded::<Zst>(2);
+    }
+
+    #[test]
+    fn non_copy_type_channel() {
+        let (mut s, mut r) = create_bounded::<AtomicBool>(1);
+        s.send(AtomicBool::new(false)).unwrap();
+
+        let b = r.try_peek(1).unwrap();
+        b[0].store(true, Ordering::Relaxed);
+        // let atomic = r.recv(1).unwrap();
+    }
+
+    #[test]
+    fn send_elements() {
+        let (mut s, mut r) = create_bounded(3);
+        for i in 0..3 {
+            s.try_send(i).unwrap();
+        }
+        assert_eq!(Ok(vec![0, 1, 2].as_slice()), r.try_peek(3));
+    }
+
+    #[test]
+    fn nonblocking_when_full() {
+        let (mut s, _r) = create_bounded(3);
+        for i in 0..3 {
+            s.try_send(i).unwrap();
+        }
+        assert_eq!(s.try_send(4), Err(SendError::Full(4)));
+    }
+
+    #[test]
+    fn send_recv_multiple_capacities() {
+        let capa = 5;
+        let (mut s, mut r) = create_bounded(capa);
+
+        let total_items = capa * 4;
+        let sending_thread = std::thread::spawn(move || {
+            for i in 0..total_items {
+                while s.try_send(i).is_err() {}
+            }
+        });
+
+        for n in 0..total_items {
+            assert_eq!(r.recv(), Ok(n));
+        }
+
+        sending_thread.join().unwrap();
+    }
+}
