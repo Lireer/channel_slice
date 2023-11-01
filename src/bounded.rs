@@ -20,7 +20,11 @@ pub enum RecvError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError<T> {
-    Full(T),
+    /// Returned by [`Sender::try_*`][Sender::try_send] methods in cases in which their non-try
+    /// counterpart would block.
+    ///
+    /// Contains the input value that could not be sent into the channel and the free capacity.
+    WouldBlock(T, usize),
     Disconnected(T),
 }
 
@@ -183,7 +187,7 @@ impl<T> Sender<T> {
         // TODO: Check if the receiver has disconnected and return SendError::Disconnected, if so.
         let len = self.len();
         if len >= self.buf.capacity {
-            return Err(SendError::Full(t));
+            return Err(SendError::WouldBlock(t, self.capacity() - len));
         }
 
         // SAFETY: We just checked, that at `len` is lower than the allowed capacity.
@@ -251,11 +255,31 @@ impl<T> Receiver<T> {
         if n > self.capacity() {
             return Err(RecvError::OutOfBounds);
         }
-        let len = self.buf.len.load(Ordering::Acquire);
+        let len = self.len();
         if len < n {
             return Err(RecvError::WouldBlock(len));
         }
 
+        unsafe { Ok(self.peek_unchecked(n)) }
+    }
+
+    /// Peeks the next `n` elements in the channel.
+    ///
+    /// This method will *block* until enough elements become available or the [`Sender`] is disconnected.
+    pub fn peek(&mut self, n: usize) -> Result<&[T], RecvError> {
+        if n > self.capacity() {
+            return Err(RecvError::OutOfBounds);
+        }
+        let len = self.len();
+        if len < n {
+            todo!("block peek until enough elements are available");
+        }
+
+        unsafe { Ok(self.peek_unchecked(n)) }
+    }
+
+    /// Peeks the next `n` elements without performing any checks.
+    unsafe fn peek_unchecked(&mut self, n: usize) -> &[T] {
         // Check if we can get `n` elements from the current half, if not switch to the other half
         // which should then contain enough elements.
         let elems_in_half = self.offset_from_half_end();
@@ -265,23 +289,27 @@ impl<T> Receiver<T> {
             self.tail = self.switch(elems_in_half);
         }
 
-        Ok(unsafe { std::slice::from_raw_parts(self.tail, n) })
-    }
-
-    pub fn peek(&mut self, n: usize) -> Result<&[T], RecvError> {
-        todo!()
+        unsafe { std::slice::from_raw_parts(self.tail, n) }
     }
 
     pub fn try_recv(&mut self) -> Result<T, RecvError> {
+        let len = self.len();
+        if len == 0 {
+            return Err(RecvError::WouldBlock(len));
+        }
         todo!()
     }
 
     pub fn recv(&mut self) -> Result<T, RecvError> {
+        let len = self.len();
+        if len == 0 {
+            todo!("block recv until an element is available");
+        }
         todo!()
     }
 
     /// Removes `n` elements from the queue, dropping them if required.
-    pub fn deque(&mut self, n: usize) -> Result<(), RecvError> {
+    pub fn dequeue(&mut self, n: usize) -> Result<(), RecvError> {
         todo!()
     }
 
@@ -352,7 +380,7 @@ mod tests {
         for i in 0..3 {
             s.try_send(i).unwrap();
         }
-        assert_eq!(s.try_send(4), Err(SendError::Full(4)));
+        assert_eq!(s.try_send(4), Err(SendError::WouldBlock(4, 0)));
     }
 
     #[test]
