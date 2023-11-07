@@ -125,6 +125,8 @@ impl<T> ChannelData<T> {
     }
 
     /// Makes `end_of_half` point to the end of the other half.
+    ///
+    /// If it's different from the end of the first half, the pointer will be set to `self.half_point()`.
     fn switch_half_ptr(&self, end_of_half: &mut *const T) {
         if *end_of_half == self.half_point() {
             // Currently in the first half, switch to the second.
@@ -185,12 +187,12 @@ impl<T> Sender<T> {
     /// Attempts to send a value on this channel
     pub fn try_send(&mut self, t: T) -> Result<(), SendError<T>> {
         // TODO: Check if the receiver has disconnected and return SendError::Disconnected, if so.
-        let len = self.len();
+        let len = dbg!(self.len());
         if len >= self.buf.capacity {
             return Err(SendError::WouldBlock(t, self.capacity() - len));
         }
 
-        // SAFETY: We just checked, that at `len` is lower than the allowed capacity.
+        // SAFETY: We just checked, that `len` is lower than the allowed capacity.
         unsafe { self.send_unchecked(t, len) };
         Ok(())
     }
@@ -230,7 +232,7 @@ impl<T> Sender<T> {
         self.head = unsafe { self.head.add(1) };
 
         // TODO: Could this be Release instead?
-        self.buf.len.fetch_add(1, Ordering::AcqRel);
+        dbg!(self.buf.len.fetch_add(1, Ordering::AcqRel));
     }
 }
 
@@ -279,6 +281,10 @@ impl<T> Receiver<T> {
     }
 
     /// Peeks the next `n` elements without performing any checks.
+    ///
+    /// # SAFETY
+    ///
+    /// Channel must contain at least `n` elements.
     unsafe fn peek_unchecked(&mut self, n: usize) -> &[T] {
         // Check if we can get `n` elements from the current half, if not switch to the other half
         // which should then contain enough elements.
@@ -286,18 +292,22 @@ impl<T> Receiver<T> {
 
         if n > elems_in_half {
             // Copy to other half and update tail accordingly.
-            self.tail = self.switch(elems_in_half);
+            //
+            // SAFETY: Switching is safe, since the check guarantees, that at least one element has
+            //         been written into the other half.
+            self.tail = unsafe { self.switch(elems_in_half) };
         }
 
         unsafe { std::slice::from_raw_parts(self.tail, n) }
     }
 
     pub fn try_recv(&mut self) -> Result<T, RecvError> {
-        let len = self.len();
+        let len = dbg!(self.len());
         if len == 0 {
             return Err(RecvError::WouldBlock(len));
         }
-        todo!()
+
+        unsafe { Ok(self.recv_unchecked()) }
     }
 
     pub fn recv(&mut self) -> Result<T, RecvError> {
@@ -305,12 +315,107 @@ impl<T> Receiver<T> {
         if len == 0 {
             todo!("block recv until an element is available");
         }
-        todo!()
+
+        unsafe { Ok(self.recv_unchecked()) }
     }
 
-    /// Removes `n` elements from the queue, dropping them if required.
+    /// Receive the next value without performing any length checks.
+    ///
+    /// # SAFETY
+    ///
+    /// Calling this method while the channel is empty is undefined behavior.
+    unsafe fn recv_unchecked(&mut self) -> T {
+        // Since `tail` always points to the next valid element
+
+        // Read the value onto the stack
+        let val: T = unsafe { std::ptr::read(self.tail) };
+
+        // Forget the value in the buffer without dropping by updating the length
+        let mut len = self.buf.len.fetch_sub(1, Ordering::AcqRel);
+        assert!(len > 0);
+        len -= 1;
+
+        // Update tail, possibly to the other half.
+        let elems_in_half = self.offset_from_half_end();
+        if elems_in_half > 1 {
+            // There are still more values left in this half
+            self.tail = unsafe { self.tail.add(1) };
+        } else {
+            // At end of half, switch to the other half without having to copy any elements.
+            self.buf.switch_half_ptr(&mut self.current_half_end);
+            self.tail = match len {
+                0 => {
+                    // len is now 0, so nothing has been written into the other half yet, update to start of other half
+                    unsafe { self.current_half_end.sub(self.buf.capacity).cast_mut() }
+                }
+                _ => {
+                    // elements have already been written into the other half, update to `space_left_by_head`
+                    unsafe {
+                        self.current_half_end
+                            .sub(
+                                self.capacity()
+                                    - self.buf.space_left_by_head.load(Ordering::Relaxed),
+                            )
+                            .cast_mut()
+                    }
+                }
+            };
+        }
+
+        val
+    }
+
+    /// Removes `n` elements from the queue without blocking, dropping them if required.
     pub fn dequeue(&mut self, n: usize) -> Result<(), RecvError> {
-        todo!()
+        if n > self.capacity() {
+            return Err(RecvError::OutOfBounds);
+        }
+        let len = self.len();
+        if len > n {
+            todo!("block dequeue until enough elements are in the queue");
+        }
+
+        unsafe { self.dequeue_unchecked(n) };
+        Ok(())
+    }
+
+    /// Removes `n` elements from the queue without blocking, dropping them if required.
+    pub fn try_dequeue(&mut self, n: usize) -> Result<(), RecvError> {
+        if n > self.capacity() {
+            return Err(RecvError::OutOfBounds);
+        }
+        let len = self.len();
+        if n > len {
+            return Err(RecvError::WouldBlock(len));
+        }
+
+        unsafe { self.dequeue_unchecked(n) };
+        Ok(())
+    }
+
+    /// # SAFETY
+    ///
+    /// The caller must ensure `self.len()` is greater than or equal to `n`.
+    unsafe fn dequeue_unchecked(&mut self, n: usize) {
+        let elems_in_half = self.offset_from_half_end();
+
+        let mut remaining = n;
+        if remaining > elems_in_half {
+            // TODO: Drop elements in this half ...
+
+            // ... and switch halfs.
+            // SAFETY: The check guarantees that at least one element has been written into the other half.
+            self.tail = unsafe { self.switch(0) };
+
+            remaining -= elems_in_half;
+        }
+
+        // TODO: Drop `remaining` elements in current half.
+
+        // Update tail to reflect the removal.
+        self.tail = unsafe { self.tail.add(remaining) };
+
+        self.buf.len.fetch_sub(n, Ordering::AcqRel);
     }
 
     fn offset_from_half_end(&self) -> usize {
@@ -318,13 +423,18 @@ impl<T> Receiver<T> {
         unsafe { self.current_half_end.offset_from(self.tail) as usize }
     }
 
-    fn switch(&mut self, elems_in_half: usize) -> *mut T {
+    /// # Safety
+    ///
+    /// `self.buf.space_left_by_head` must be in the other half, which means that the head must be
+    /// in the half that the tail will be switched to.
+    unsafe fn switch(&mut self, elems_in_half: usize) -> *mut T {
         self.buf.switch_half_ptr(&mut self.current_half_end);
         let space_left_by_head = self.buf.space_left_by_head.load(Ordering::Relaxed);
         assert!(space_left_by_head >= elems_in_half);
 
+        let other_half_start = unsafe { self.current_half_end.sub(self.capacity()) };
         let new_tail: *mut T =
-            unsafe { self.buf.data_ptr.add(space_left_by_head - elems_in_half) }.cast_mut();
+            unsafe { other_half_start.add(space_left_by_head - elems_in_half) }.cast_mut();
         unsafe { std::ptr::copy_nonoverlapping(self.tail, new_tail, elems_in_half) };
         new_tail
     }
@@ -335,6 +445,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::bounded::{create_bounded, SendError};
+
+    use super::RecvError;
 
     #[test]
     #[should_panic(expected = "capacity is 0 but must be at least 1")]
@@ -400,5 +512,122 @@ mod tests {
         }
 
         sending_thread.join().unwrap();
+    }
+
+    #[test]
+    fn try_send_recv_multiple_capacities() {
+        let capa = 5;
+        let (mut s, mut r) = create_bounded(capa);
+
+        let total_items = capa * 4;
+        let sending_thread = std::thread::spawn(move || {
+            let data = s.buf.data_ptr;
+            for i in 0..total_items {
+                // dbg!(&s);
+                while s.try_send(i).is_err() {}
+                println!("after send {i}: {:?}", unsafe {
+                    std::slice::from_raw_parts(data, capa * 2)
+                });
+            }
+        });
+
+        let data = r.buf.data_ptr;
+        for n in 0..total_items {
+            loop {
+                match r.try_recv() {
+                    Ok(val) => {
+                        // dbg!(val, n);
+                        // dbg!(&r);
+                        println!("after recv {n}: {:?}", unsafe {
+                            std::slice::from_raw_parts(data, capa * 2)
+                        });
+                        assert_eq!(val, n);
+                        break;
+                    }
+                    Err(RecvError::WouldBlock(0)) => continue,
+                    Err(e) => panic!("unexpected error: {:?}", e),
+                }
+            }
+        }
+
+        sending_thread.join().unwrap();
+    }
+
+    #[test]
+    fn send_till_full() {
+        let (mut s, _r) = create_bounded(3);
+        assert_eq!(s.try_send(0), Ok(()));
+        assert_eq!(s.try_send(1), Ok(()));
+        assert_eq!(s.try_send(2), Ok(()));
+        assert_eq!(s.try_send(3), Err(SendError::WouldBlock(3, 0)));
+        assert_eq!(s.try_send(4), Err(SendError::WouldBlock(4, 0)));
+    }
+
+    #[test]
+    fn oh_no() {
+        let (mut s, mut r) = create_bounded::<u32>(3);
+        // _ _ _ | _ _ _
+        assert_eq!(s.try_send(0), Ok(()));
+        // 0 _ _ | _ _ _
+        assert_eq!(s.try_send(1), Ok(()));
+        // 0 1 _ | _ _ _
+        assert_eq!(s.try_send(2), Ok(()));
+        // 0 1 2 | _ _ _   len: 3
+        assert_eq!(r.try_recv(), Ok(0));
+        // _ 1 2 | _ _ _   len: 2
+        assert_eq!(s.try_send(3), Ok(()));
+        // _ 1 2 | _ _ 3   len: 3
+        assert_eq!(r.try_recv(), Ok(1));
+        // _ _ 2 | _ _ 3   len: 2
+        assert_eq!(s.try_send(4), Ok(()));
+        // ? ? 2 | _ _ 3   len: 3
+        assert_eq!(r.try_recv(), Ok(2)); // <-- Panics because it receives 4 instead of 2 D:
+    }
+
+    #[test]
+    fn single_thread_recv_one_by_one() {
+        let capa = 5;
+        let (mut s, mut r) = create_bounded(capa);
+        let data = r.buf.data_ptr;
+
+        for i in 0..(capa * 4) {
+            assert_eq!(s.try_send(i), Ok(()));
+            println!("after send {i}: {:?}", unsafe {
+                std::slice::from_raw_parts(data, capa * 2)
+            });
+            assert_eq!(r.try_recv(), Ok(i));
+            println!("after recv {i}: {:?}", unsafe {
+                std::slice::from_raw_parts(data, capa * 2)
+            });
+        }
+    }
+
+    #[test]
+    fn single_thread_dequeue_one_by_one() {
+        let capa = 5;
+        let (mut s, mut r) = create_bounded(capa);
+
+        for i in 0..(capa * 4) {
+            assert_eq!(s.try_send(i), Ok(()));
+            assert_eq!(r.peek(1).unwrap(), &[i]);
+            assert_eq!(r.dequeue(1), Ok(()));
+        }
+    }
+
+    #[test]
+    fn dequeue() {
+        let capa = 5;
+        let (mut s, mut r) = create_bounded(capa);
+
+        let mut first_elem = 0;
+        for i in 0..(capa * 10) {
+            assert_eq!(s.try_send(i), Ok(()));
+            if (i + 1) % 4 == 0 {
+                assert_eq!(r.dequeue(4), Ok(()));
+                first_elem += 4;
+            } else {
+                assert_eq!(r.try_peek(1).unwrap(), &[first_elem]);
+            }
+        }
     }
 }
