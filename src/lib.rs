@@ -1,5 +1,6 @@
 pub mod bounded;
 pub mod expl_sync;
+pub mod lock_free_ringbuf;
 
 pub trait SliceBufRead<T> {
     type Slice<'data>
