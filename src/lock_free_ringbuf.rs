@@ -1,9 +1,6 @@
 use std::{
     borrow::Cow,
-    sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub fn create_bounded<T>(capacity: usize) -> (Writer<T>, Reader<T>) {
@@ -13,12 +10,10 @@ pub fn create_bounded<T>(capacity: usize) -> (Writer<T>, Reader<T>) {
     let writer = Writer {
         inner,
         write_pos: buf_ptr,
-        counterpart_dropped: AtomicBool::new(false),
     };
     let reader = Reader {
         inner,
         read_pos: buf_ptr,
-        counterpart_dropped: AtomicBool::new(false),
     };
     (writer, reader)
 }
@@ -66,6 +61,7 @@ impl<T> Inner<T> {
             buf,
             capacity,
             len: AtomicUsize::new(0),
+            counterpart_dropped: AtomicBool::new(false),
         }
     }
 
@@ -166,10 +162,11 @@ impl<T> Reader<T> {
     //     todo!()
     // }
 
-    /// Removes up to `n` elements from the front of the queue.
+    /// Removes and drops up to `n` elements from the front of the queue.
     ///
     /// Returns how many elements were removed.
     pub fn remove(&mut self, n: usize) -> usize {
+        // Drop elements
         todo!()
     }
 }
@@ -197,7 +194,13 @@ where
 
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
-        // FIXME: Drop all elements in the buffer. Has to done in the writer/reader drop impls.
+        // Check that all elements have been removed.
+        assert_eq!(
+            self.len.load(Ordering::Relaxed),
+            0,
+            "Not all elements have been removed."
+        );
+
         let layout = std::alloc::Layout::array::<T>(self.capacity).unwrap();
         unsafe {
             std::alloc::dealloc(self.buf as *mut u8, layout);
@@ -232,9 +235,60 @@ impl<T> Drop for Writer<T> {
         // If the reader has been dropped, it falls upon the writer to clean up the memory.
         if counterpart_dropped {
             // SAFETY: The reader has been dropped, so it's safe to drop `inner`.
-            unsafe {
-                _ = Box::from_raw(self.inner as *mut Inner<T>);
+            let inner = unsafe { Box::from_raw(self.inner as *mut Inner<T>) };
+
+            // TODO: Nothing else to drop if T is a ZST.
+            if std::mem::size_of::<T>() == 0 {
+                return;
             }
+
+            // Drop elements in the buffer.
+
+            // Can use `Relaxed` here since we're the only with access to `inner` at this point.
+            let len = inner.len.load(Ordering::Relaxed);
+            let offset_from_start = unsafe { self.write_pos.offset_from(inner.buf) };
+            assert!(
+                offset_from_start >= 0,
+                "offset_from_start is negative ({}), write_pos: {:p}, buf: {:p}",
+                offset_from_start,
+                self.write_pos,
+                inner.buf
+            );
+
+            let offset_from_start = offset_from_start as usize;
+            if offset_from_start <= len {
+                // Case 1: All elements are contiguous in memory.
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        self.write_pos.sub(len) as *mut T,
+                        len,
+                    ));
+                }
+                // Reduce length so it passes the check in `Inner::drop`.
+                inner.len.fetch_sub(len, Ordering::Relaxed);
+            } else {
+                // Case 2: Elements are split into two contiguous slices at the end of the buffer.
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        inner.buf as *mut T,
+                        offset_from_start,
+                    ));
+                }
+                let remaining = len - offset_from_start;
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        inner.end_of_buf().sub(remaining) as *mut T,
+                        remaining,
+                    ));
+                }
+                // Reduce length so it passes the check in `Inner::drop`.
+                inner
+                    .len
+                    .fetch_sub(offset_from_start + remaining, Ordering::Relaxed);
+            }
+
+            // Drop `inner` explicitly and let it take care of freeing the buffer's memory.
+            drop(inner);
         }
     }
 }
