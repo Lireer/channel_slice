@@ -27,6 +27,8 @@ struct Inner<T> {
     buf: *const T,
     capacity: usize,
     len: AtomicUsize,
+    /// Is set if either the [`Reader`] or [`Writer`] has been dropped.
+    counterpart_dropped: AtomicBool,
 }
 
 pub struct Reader<T> {
@@ -36,18 +38,14 @@ pub struct Reader<T> {
     ///
     /// Always points into the buffer.
     read_pos: *const T,
-    /// Is set if the [`Writer`] has been dropped.
-    counterpart_dropped: AtomicBool,
 }
 
 pub struct Writer<T> {
     inner: *const Inner<T>,
     /// Points to the next element to write.
-    // TODO: What happens at the end of the buffer? Point to the first element outside the buffer or
-    //       to the first element in the buffer?
+    ///
+    /// Always points into the buffer.
     write_pos: *const T,
-    /// Is set if the [`Reader`] has been dropped.
-    counterpart_dropped: AtomicBool,
 }
 
 impl<T> Inner<T> {
@@ -123,10 +121,10 @@ impl<T> Reader<T> {
             // SAFETY: We know that there are at least `elems_to_read` contiguous elements starting
             // from `self.read_pos`.
             unsafe {
-                std::ptr::copy_nonoverlapping(self.read_pos, output.as_mut_ptr(), elems_to_read)
+                std::ptr::copy_nonoverlapping(self.read_pos, output.as_mut_ptr(), elems_to_read);
+                output.set_len(elems_to_read);
             };
 
-            // TODO: how to handle and change read_pos when len == n?
             self.read_pos = unsafe { self.read_pos.add(elems_to_read) };
             if self.read_pos == end_of_buf {
                 // Wrap around at the end of the buffer.
@@ -137,7 +135,25 @@ impl<T> Reader<T> {
                 .fetch_sub(elems_to_read, Ordering::Release);
         } else {
             // Case 2: The next n elements wrap around at the end of the buffer.
-            todo!();
+
+            // Copy the first part up to the end of the buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.read_pos, output.as_mut_ptr(), elems_to_end);
+            }
+
+            let remaining = elems_to_read - elems_to_end;
+
+            // Copy the second part from the start of the buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (&*self.inner).buf,
+                    output.as_mut_ptr().add(elems_to_end),
+                    remaining,
+                );
+                output.set_len(elems_to_read);
+            }
+
+            self.read_pos = unsafe { (&*self.inner).buf.add(remaining) };
         }
         output
     }
@@ -179,14 +195,46 @@ where
 
 // TODO: impl std::io::Read for Receiver<u8>
 
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        // FIXME: Drop all elements in the buffer. Has to done in the writer/reader drop impls.
+        let layout = std::alloc::Layout::array::<T>(self.capacity).unwrap();
+        unsafe {
+            std::alloc::dealloc(self.buf as *mut u8, layout);
+        }
+    }
+}
+
 impl<T> Drop for Reader<T> {
     fn drop(&mut self) {
-        todo!()
+        // Check if the writer has been dropped and set the flag if it hasn't.
+        let counterpart_dropped = unsafe { &*self.inner }
+            .counterpart_dropped
+            .swap(true, Ordering::AcqRel);
+
+        // If the writer has been dropped, it falls upon the reader to clean up the memory.
+        if counterpart_dropped {
+            // SAFETY: The writer has been dropped, so it's safe to drop `inner`.
+            unsafe {
+                _ = Box::from_raw(self.inner as *mut Inner<T>);
+            }
+        }
     }
 }
 
 impl<T> Drop for Writer<T> {
     fn drop(&mut self) {
-        todo!()
+        // Check if the reader has been dropped and set the flag if it hasn't.
+        let counterpart_dropped = unsafe { &*self.inner }
+            .counterpart_dropped
+            .swap(true, Ordering::AcqRel);
+
+        // If the reader has been dropped, it falls upon the writer to clean up the memory.
+        if counterpart_dropped {
+            // SAFETY: The reader has been dropped, so it's safe to drop `inner`.
+            unsafe {
+                _ = Box::from_raw(self.inner as *mut Inner<T>);
+            }
+        }
     }
 }
