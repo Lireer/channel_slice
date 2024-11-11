@@ -76,17 +76,43 @@ impl<T> Inner<T> {
 }
 
 impl<T> Reader<T> {
-    // pub fn len(&self) -> usize {
-    //     todo!()
-    // }
+    /// Returns the number of elements in the buffer.
+    pub fn len(&self) -> usize {
+        unsafe { &*self.inner }.len.load(Ordering::Acquire)
+    }
 
-    // pub fn peek(&self, n: usize) -> (&[T], &[T]) {
-    //     todo!()
-    // }
+    /// Returns the number of continguous elements starting from the [`Reader`]'s current position.
+    ///
+    /// In the following case, the length without wrap would be 5 since the values from `3` through
+    /// `7` could be read contiguously:
+    ///
+    /// ```txt
+    /// 8 _ _ 3 4 5 6 7
+    ///       ^^^^^^^^^
+    ///       ↑
+    ///       Reader position
+    /// ```
+    pub fn len_without_wrap(&self) -> usize {
+        let elements_to_end = unsafe { (*self.inner).end_of_buf().offset_from(self.read_pos) };
+        assert!(
+            elements_to_end >= 0,
+            "elements_to_end is negative ({}), end_of_buf: {:p}, read_pos: {:p}",
+            elements_to_end,
+            unsafe { &*self.inner }.end_of_buf(),
+            self.read_pos
+        );
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        len.min(elements_to_end as usize)
+    }
 
-    /// Reads and removes up to `n` elements from the front of the queue.
+    /// Retunrs whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Reads and removes up to `n` elements from the front of the buffer.
     ///
     /// Lock-free and non-blocking.
+    // TODO: Check if the writer part has been dropped.
     pub fn read(&mut self, n: usize) -> Vec<T> {
         let end_of_buf = unsafe { &*self.inner }.end_of_buf();
         // There are two scenarios to consider:
@@ -142,32 +168,124 @@ impl<T> Reader<T> {
             // Copy the second part from the start of the buffer.
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    (&*self.inner).buf,
+                    (*self.inner).buf,
                     output.as_mut_ptr().add(elems_to_end),
                     remaining,
                 );
                 output.set_len(elems_to_read);
             }
 
-            self.read_pos = unsafe { (&*self.inner).buf.add(remaining) };
+            self.read_pos = unsafe { (*self.inner).buf.add(remaining) };
         }
         output
     }
 
-    pub fn read_exact(&self, n: usize) -> Result<&[T], ()> {
+    /// Reads and removes exactly `n` elements from the front of the buffer.
+    ///
+    /// Returns
+    pub fn read_exact(&self, n: usize) -> Result<&[T], usize> {
         todo!()
     }
+
+    // pub fn peek(&self, n: usize) -> (&[T], &[T]) {
+    //     todo!()
+    // }
 
     // pub fn read_into(&self, n: usize, buf: &mut Vec<T>) {
     //     todo!()
     // }
 
-    /// Removes and drops up to `n` elements from the front of the queue.
+    /// Removes up to `n` elements from the front of the buffer.
     ///
-    /// Returns how many elements were removed.
+    /// Returns the number of elements removed.
     pub fn remove(&mut self, n: usize) -> usize {
-        // Drop elements
-        todo!()
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        let elems_to_remove = n.min(len);
+        unsafe {
+            self.remove_unchecked(elems_to_remove);
+        }
+        elems_to_remove
+    }
+
+    /// Removes `n` elements from the front of the buffer wihtout checking the buffer's length.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `n <= self.len()`, else uninitialized memory will be read.
+    pub unsafe fn remove_unchecked(&mut self, n: usize) {
+        // Handle ZSTs or rather, don't handle them.
+        if std::mem::size_of::<T>() != 0 {
+            let end_of_buf = unsafe { &*self.inner }.end_of_buf();
+            let elems_to_end = unsafe { end_of_buf.offset_from(self.read_pos) };
+            assert!(
+                elems_to_end >= 0,
+                "elems_to_end is negative ({}), end_of_buf: {:p}, read_pos: {:p}",
+                elems_to_end,
+                end_of_buf,
+                self.read_pos
+            );
+            let elems_to_end = elems_to_end as usize;
+
+            if elems_to_end >= n {
+                // Case 1: The next n elements are contiguous in memory.
+
+                // SAFETY: We know that there are at least `n` contiguous elements starting from
+                // `self.read_pos`.
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        self.read_pos as *mut T,
+                        n,
+                    ))
+                };
+
+                self.read_pos = unsafe { self.read_pos.add(n) };
+                if self.read_pos == end_of_buf {
+                    // Wrap around at the end of the buffer.
+                    self.read_pos = unsafe { &*self.inner }.buf;
+                }
+            } else {
+                // Case 2: The next n elements wrap around at the end of the buffer.
+
+                // Drop the first part up to the end of the buffer.
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        self.read_pos as *mut T,
+                        elems_to_end,
+                    ))
+                };
+
+                let remaining = n - elems_to_end;
+
+                // Drop the second part from the start of the buffer.
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        (*self.inner).buf as *mut T,
+                        remaining,
+                    ))
+                };
+
+                self.read_pos = unsafe { (*self.inner).buf.add(remaining) };
+            }
+        }
+
+        let previous_len = unsafe { &*self.inner }.len.fetch_sub(n, Ordering::AcqRel);
+        debug_assert!(
+            previous_len >= n,
+            "previous_len: {}, n: {}",
+            previous_len,
+            n
+        );
+    }
+
+    /// Removes all elements from the buffer.
+    ///
+    /// Does **not** guarantee that `self.len() == 0` after the call, since elements may be added by
+    /// the [`Writer`] concurrently.
+    pub fn clear(&mut self) {
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        unsafe {
+            self.remove_unchecked(len);
+        }
     }
 }
 
@@ -175,17 +293,19 @@ impl<T> Reader<T>
 where
     T: Copy,
 {
-    /// Peeks at the next `n` elements in the queue.
+    /// Peeks at the next `n` elements in the buffer.
     ///
-    /// If there are fewer than `n` elements in the queue, all of them will be returned. The return
+    /// If there are fewer than `n` elements in the buffer, all of them will be returned. The return
     /// value is [`Cow::Borrowed`] if the elements are contiguous in memory, else they are copied
     /// into a [`Vec`] and returned as [`Cow::Owned`] to make them contiguous.
     pub fn peek_cow(&self, n: usize) -> Cow<'_, [T]> {
         todo!()
     }
 
-    /// Peeks at exactly `n` elements at the start of the queue.
-    pub fn peek_cow_exact(&self, n: usize) -> Result<Cow<'_, [T]>, ()> {
+    /// Peeks at exactly `n` elements at the start of the buffer.
+    ///
+    /// If there are fewer than `n` elements in the buffer, their number is returned as an error.
+    pub fn peek_cow_exact(&self, n: usize) -> Result<Cow<'_, [T]>, usize> {
         todo!()
     }
 }
@@ -218,9 +338,12 @@ impl<T> Drop for Reader<T> {
         // If the writer has been dropped, it falls upon the reader to clean up the memory.
         if counterpart_dropped {
             // SAFETY: The writer has been dropped, so it's safe to drop `inner`.
-            unsafe {
-                _ = Box::from_raw(self.inner as *mut Inner<T>);
-            }
+            let inner = unsafe { Box::from_raw(self.inner as *mut Inner<T>) };
+
+            // Drop elements in the buffer. This handles T being a ZST as well.
+            self.clear();
+
+            drop(inner);
         }
     }
 }
@@ -237,15 +360,15 @@ impl<T> Drop for Writer<T> {
             // SAFETY: The reader has been dropped, so it's safe to drop `inner`.
             let inner = unsafe { Box::from_raw(self.inner as *mut Inner<T>) };
 
-            // TODO: Nothing else to drop if T is a ZST.
+            // Nothing else to drop if T is a ZST.
             if std::mem::size_of::<T>() == 0 {
                 return;
             }
 
             // Drop elements in the buffer.
 
-            // Can use `Relaxed` here since we're the only with access to `inner` at this point.
-            let len = inner.len.load(Ordering::Relaxed);
+            // Use `Acquire` here to make sure we get the latest value of the buffers length.
+            let len = inner.len.load(Ordering::Acquire);
             let offset_from_start = unsafe { self.write_pos.offset_from(inner.buf) };
             assert!(
                 offset_from_start >= 0,
@@ -264,7 +387,8 @@ impl<T> Drop for Writer<T> {
                         len,
                     ));
                 }
-                // Reduce length so it passes the check in `Inner::drop`.
+                // Reduce length so it passes the check in `Inner::drop`. Use `Relaxed` here since
+                // we're not racing with any other threads and already synchronized with the reader.
                 inner.len.fetch_sub(len, Ordering::Relaxed);
             } else {
                 // Case 2: Elements are split into two contiguous slices at the end of the buffer.
@@ -281,7 +405,8 @@ impl<T> Drop for Writer<T> {
                         remaining,
                     ));
                 }
-                // Reduce length so it passes the check in `Inner::drop`.
+                // Reduce length so it passes the check in `Inner::drop`. Use `Relaxed` here since
+                // we're not racing with any other threads and already synchronized with the reader.
                 inner
                     .len
                     .fetch_sub(offset_from_start + remaining, Ordering::Relaxed);
