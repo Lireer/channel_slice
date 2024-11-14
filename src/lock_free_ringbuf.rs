@@ -3,15 +3,15 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-pub fn create_bounded<T>(capacity: usize) -> (Writer<T>, Reader<T>) {
+pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Inner::with_capacity(capacity);
-    let buf_ptr = inner.buf;
+    let buf_ptr: *const T = inner.buf;
     let inner = Box::into_raw(Box::new(inner));
-    let writer = Writer {
+    let writer = Sender {
         inner,
-        write_pos: buf_ptr,
+        write_pos: buf_ptr.cast_mut(),
     };
-    let reader = Reader {
+    let reader = Receiver {
         inner,
         read_pos: buf_ptr,
     };
@@ -22,11 +22,11 @@ struct Inner<T> {
     buf: *const T,
     capacity: usize,
     len: AtomicUsize,
-    /// Is set if either the [`Reader`] or [`Writer`] has been dropped.
+    /// Is set if either the [`Receiver`] or [`Sender`] has been dropped.
     counterpart_dropped: AtomicBool,
 }
 
-pub struct Reader<T> {
+pub struct Receiver<T> {
     inner: *const Inner<T>,
     // inner: AtomicPtr<Inner<T>>,
     /// Points to the next element to read.
@@ -35,12 +35,13 @@ pub struct Reader<T> {
     read_pos: *const T,
 }
 
-pub struct Writer<T> {
+pub struct Sender<T> {
     inner: *const Inner<T>,
     /// Points to the next element to write.
     ///
-    /// Always points into the buffer.
-    write_pos: *const T,
+    /// Always points into the buffer and as long as the buffer is not full, `write_pos` can always
+    /// be written to.
+    write_pos: *mut T,
 }
 
 impl<T> Inner<T> {
@@ -52,7 +53,7 @@ impl<T> Inner<T> {
     /// `isize::MAX` if rounded up to the nearest multiple of `T`'s alignment.
     fn with_capacity(capacity: usize) -> Self {
         let layout = std::alloc::Layout::array::<T>(capacity).unwrap();
-        let buf: *mut T = unsafe { std::alloc::alloc(layout) } as *mut T;
+        let buf: *mut T = unsafe { std::alloc::alloc(layout) }.cast();
         if buf.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
@@ -75,13 +76,13 @@ impl<T> Inner<T> {
     }
 }
 
-impl<T> Reader<T> {
+impl<T> Receiver<T> {
     /// Returns the number of elements in the buffer.
     pub fn len(&self) -> usize {
         unsafe { &*self.inner }.len.load(Ordering::Acquire)
     }
 
-    /// Returns the number of continguous elements starting from the [`Reader`]'s current position.
+    /// Returns the number of continguous elements starting from the [`Receiver`]'s current position.
     ///
     /// In the following case, the length without wrap would be 5 since the values from `3` through
     /// `7` could be read contiguously:
@@ -90,7 +91,7 @@ impl<T> Reader<T> {
     /// 8 _ _ 3 4 5 6 7
     ///       ^^^^^^^^^
     ///       ↑
-    ///       Reader position
+    ///       Receiver position
     /// ```
     pub fn len_without_wrap(&self) -> usize {
         let elements_to_end = unsafe { (*self.inner).end_of_buf().offset_from(self.read_pos) };
@@ -109,6 +110,28 @@ impl<T> Reader<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    // TODO: Instead maybe switch to these methods:
+    // read -> 0 to n elements
+    // read_exact -> exactly n elements, blocking until they are available
+    // try_read_exact -> exactly n elements, non-blocking
+    //
+    // peek -> 0 to n elements
+    // peek_exact -> exactly n elements, blocking until they are available or return an error if impossible
+    // try_peek_exact -> exactly n elements, non-blocking, return an error if impossible
+    //
+    //
+    // read_into -> read into a buffer
+    // read_into_exact -> read exactly n elements into a buffer, blocking until they are available
+    // try_read_into_exact -> read exactly n elements into a buffer, non-blocking
+    // read_into_unchecked -> read exactly n elements into a buffer without checking the reader's length
+    //
+    // clear
+    // remove -> remove up to n elements
+    // remove_exact -> remove exactly n elements, blocking until they are available
+    // try_remove_exact -> remove exactly n elements, non-blocking
+    // remove_unchecked -> remove exactly n elements without checking the buffer's length
+
     /// Reads and removes up to `n` elements from the front of the buffer.
     ///
     /// Lock-free and non-blocking.
@@ -233,7 +256,7 @@ impl<T> Reader<T> {
                 // `self.read_pos`.
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                        self.read_pos as *mut T,
+                        self.read_pos.cast_mut(),
                         n,
                     ))
                 };
@@ -249,7 +272,7 @@ impl<T> Reader<T> {
                 // Drop the first part up to the end of the buffer.
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                        self.read_pos as *mut T,
+                        self.read_pos.cast_mut(),
                         elems_to_end,
                     ))
                 };
@@ -259,7 +282,7 @@ impl<T> Reader<T> {
                 // Drop the second part from the start of the buffer.
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                        (*self.inner).buf as *mut T,
+                        (*self.inner).buf.cast_mut(),
                         remaining,
                     ))
                 };
@@ -280,7 +303,7 @@ impl<T> Reader<T> {
     /// Removes all elements from the buffer.
     ///
     /// Does **not** guarantee that `self.len() == 0` after the call, since elements may be added by
-    /// the [`Writer`] concurrently.
+    /// the [`Sender`] concurrently.
     pub fn clear(&mut self) {
         let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
         unsafe {
@@ -289,7 +312,7 @@ impl<T> Reader<T> {
     }
 }
 
-impl<T> Reader<T>
+impl<T> Receiver<T>
 where
     T: Copy,
 {
@@ -310,7 +333,99 @@ where
     }
 }
 
+impl<T> Sender<T> {
+    pub fn len(&self) -> usize {
+        unsafe { &*self.inner }.len.load(Ordering::Acquire)
+    }
+
+    pub fn capacity(&self) -> usize {
+        unsafe { &*self.inner }.capacity
+    }
+
+    pub fn space_to_end(&self) -> usize {
+        let end_of_buf = unsafe { &*self.inner }.end_of_buf();
+        let space_to_end = unsafe { end_of_buf.offset_from(self.write_pos) };
+        assert!(
+            space_to_end >= 0,
+            "space_to_end is negative ({}), end_of_buf: {:p}, write_pos: {:p}",
+            space_to_end,
+            end_of_buf,
+            self.write_pos
+        );
+        space_to_end as usize
+    }
+
+    /// Sends a value to the buffer, blocking until there is space.
+    ///
+    /// Also returns if the receiver has been dropped.
+    ///
+    /// blocking, lock-free
+    // TODO: Wrap T in an Error that also handles the `Receiver` being dropped.
+    // pub fn send(&mut self, t: T) -> Result<(), > {
+    //     todo!()
+    // }
+
+    /// Sends a value to the buffer, immediately returning if there is no space.
+    ///
+    /// non-blocking, lock-free
+    // TODO: Wrap T in an Error that also handles the `Receiver` being dropped.
+    pub fn try_send(&mut self, t: T) -> Result<(), T> {
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        let capacity = unsafe { &*self.inner }.capacity;
+        if len == capacity {
+            return Err(t);
+        }
+
+        // SAFETY: We know that there is space in the buffer.
+        unsafe {
+            std::ptr::write(self.write_pos, t);
+        }
+
+        self.write_pos = unsafe { self.write_pos.add(1) };
+        if self.write_pos as *const _ == unsafe { &*self.inner }.end_of_buf() {
+            // Wrap around at the end of the buffer.
+            self.write_pos = unsafe { &*self.inner }.buf.cast_mut();
+        }
+
+        unsafe { &*self.inner }.len.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Sends a slice to the buffer, immediately returning if there is no space.
+    // non-blocking, lock-free
+    pub fn try_send_vec(&mut self, vec: Vec<T>) -> Result<(), Vec<T>> {
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        let capacity = unsafe { &*self.inner }.capacity;
+        if len + vec.len() > capacity {
+            return Err(vec);
+        }
+
+        let space_to_end = self.space_to_end();
+        let offset_from_start = unsafe { self.write_pos.offset_from((*self.inner).buf) };
+        assert!(
+            offset_from_start >= 0,
+            "offset_from_start is negative ({}), write_pos: {:p}, buf: {:p}",
+            offset_from_start,
+            self.write_pos,
+            unsafe { &*self.inner }.buf
+        );
+        let offset_from_start = offset_from_start as usize;
+
+        todo!()
+    }
+
+    // non-blocking, lock-free
+    pub fn try_send_iter<I>(&mut self, iter: I) -> Result<(), I>
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        todo!()
+    }
+}
+
 // TODO: impl std::io::Read for Receiver<u8>
+// TODO: impl std::io::Write for Sender<u8>
 
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
@@ -323,12 +438,12 @@ impl<T> Drop for Inner<T> {
 
         let layout = std::alloc::Layout::array::<T>(self.capacity).unwrap();
         unsafe {
-            std::alloc::dealloc(self.buf as *mut u8, layout);
+            std::alloc::dealloc(self.buf.cast_mut().cast(), layout);
         }
     }
 }
 
-impl<T> Drop for Reader<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         // Check if the writer has been dropped and set the flag if it hasn't.
         let counterpart_dropped = unsafe { &*self.inner }
@@ -338,7 +453,7 @@ impl<T> Drop for Reader<T> {
         // If the writer has been dropped, it falls upon the reader to clean up the memory.
         if counterpart_dropped {
             // SAFETY: The writer has been dropped, so it's safe to drop `inner`.
-            let inner = unsafe { Box::from_raw(self.inner as *mut Inner<T>) };
+            let inner = unsafe { Box::from_raw(self.inner.cast_mut()) };
 
             // Drop elements in the buffer. This handles T being a ZST as well.
             self.clear();
@@ -348,7 +463,7 @@ impl<T> Drop for Reader<T> {
     }
 }
 
-impl<T> Drop for Writer<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // Check if the reader has been dropped and set the flag if it hasn't.
         let counterpart_dropped = unsafe { &*self.inner }
@@ -358,7 +473,7 @@ impl<T> Drop for Writer<T> {
         // If the reader has been dropped, it falls upon the writer to clean up the memory.
         if counterpart_dropped {
             // SAFETY: The reader has been dropped, so it's safe to drop `inner`.
-            let inner = unsafe { Box::from_raw(self.inner as *mut Inner<T>) };
+            let inner = unsafe { Box::from_raw(self.inner.cast_mut()) };
 
             // Nothing else to drop if T is a ZST.
             if std::mem::size_of::<T>() == 0 {
@@ -383,7 +498,7 @@ impl<T> Drop for Writer<T> {
                 // Case 1: All elements are contiguous in memory.
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                        self.write_pos.sub(len) as *mut T,
+                        self.write_pos.sub(len),
                         len,
                     ));
                 }
@@ -394,14 +509,14 @@ impl<T> Drop for Writer<T> {
                 // Case 2: Elements are split into two contiguous slices at the end of the buffer.
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                        inner.buf as *mut T,
+                        inner.buf.cast_mut(),
                         offset_from_start,
                     ));
                 }
                 let remaining = len - offset_from_start;
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                        inner.end_of_buf().sub(remaining) as *mut T,
+                        inner.end_of_buf().sub(remaining).cast_mut(),
                         remaining,
                     ));
                 }
