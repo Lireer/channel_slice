@@ -1,16 +1,22 @@
 use std::{collections::VecDeque, sync::Arc, thread};
 
 use parking_lot::Mutex;
-use slicebuf::expl_sync;
+use slicebuf::{
+    expl_sync,
+    lock_free_ringbuf::{self, SendError},
+};
 
-// The use case we're benchmarking here is processing of audio samples. Example
-// audio format is mono channel, 16kHz and bit depth of 32. Buffers will
-// initially allocate memory for half a second of audio, i.e. 8000 samples/32000 bytes.
-// Samples will be written in blocks of 40ms / 640 samples
+// The use case we're benchmarking here is processing of audio samples.
+//
+// # Example
+//
+// - audio format is mono channel, 16kHz and bit depth of 32
+// - Buffers will initially allocate memory for half a second of audio, i.e. 8000 samples or 32000 bytes
+// - Samples will be written in blocks of 40ms / 640 samples
 
 pub const SAMPLE_RATE: usize = 16000;
 const INITIAL_BUFFER_SIZE: usize = SAMPLE_RATE / 2;
-pub const WRITE_SIZE: usize = SAMPLE_RATE / 25;
+pub const INPUT_BLOCK_SIZE: usize = SAMPLE_RATE / 25; // 25 Blocks per second
 const READ_SIZE: usize = 1600;
 
 pub fn std_vecdeque(samples: &mut Vec<Vec<f32>>) {
@@ -20,7 +26,7 @@ pub fn std_vecdeque(samples: &mut Vec<Vec<f32>>) {
 
     let reader_handle = thread::spawn({
         let mut drained = 0;
-        let limit = samples.len() / READ_SIZE;
+        let limit = samples.len() * INPUT_BLOCK_SIZE;
         let buf = buf.clone();
         move || loop {
             let mut buf = buf.lock();
@@ -55,7 +61,7 @@ pub fn explicit_sync(samples: &mut Vec<Vec<f32>>) {
 
     let reader_handle = thread::spawn({
         let mut drained = 0;
-        let limit = samples.len() / READ_SIZE;
+        let limit = samples.len() * INPUT_BLOCK_SIZE;
         move || loop {
             if let Some(slice) = reader.slice_to(READ_SIZE) {
                 drained += slice.len();
@@ -85,6 +91,45 @@ pub fn explicit_sync(samples: &mut Vec<Vec<f32>>) {
     reader_handle.join().unwrap();
 }
 
+pub fn lf_ringbuf(samples: &mut Vec<Vec<f32>>) {
+    let (mut sender, mut recv) = lock_free_ringbuf::create_bounded(INITIAL_BUFFER_SIZE);
+
+    let recv_handle = thread::spawn({
+        let mut drained = 0;
+        let limit = samples.len() * INPUT_BLOCK_SIZE;
+        move || {
+            while drained < limit {
+                if recv.len() >= READ_SIZE {
+                    drained += recv.read(READ_SIZE).len();
+                }
+            }
+        }
+    });
+
+    thread::scope({
+        |scope| {
+            scope
+                .spawn(|| {
+                    while let Some(mut block) = samples.pop() {
+                        loop {
+                            match sender.try_send_vec(block) {
+                                Ok(_) => break,
+                                Err(SendError::Full(b)) => block = b,
+                                Err(SendError::Dropped(_)) => {
+                                    unreachable!("Receiver disconnected");
+                                }
+                            }
+                        }
+                    }
+                })
+                .join()
+                .unwrap();
+        }
+    });
+
+    recv_handle.join().unwrap();
+}
+
 fn avg(samples: &[f32]) -> f32 {
     // dbg!(samples[0], samples[samples.len() - 1]);
     samples.iter().sum::<f32>() / samples.len() as f32
@@ -97,7 +142,7 @@ pub fn std_vecdeque_do_work(samples: &mut Vec<Vec<f32>>) {
 
     let reader_handle = thread::spawn({
         // Try to process as many samples as possible but subtract READ_SIZE to avoid edge cases.
-        let limit = samples.len() * WRITE_SIZE - READ_SIZE;
+        let limit = samples.len() * INPUT_BLOCK_SIZE - READ_SIZE;
         let buf = buf.clone();
 
         let mut expensive_mode = false;
@@ -170,7 +215,7 @@ pub fn explicit_sync_do_work(samples: &mut Vec<Vec<f32>>) {
 
     let reader_handle = thread::spawn({
         // Try to process as many samples as possible but subtract READ_SIZE to avoid edge cases.
-        let limit = samples.len() * WRITE_SIZE - READ_SIZE;
+        let limit = samples.len() * INPUT_BLOCK_SIZE - READ_SIZE;
 
         let mut expensive_mode = false;
         let mut read = 0;

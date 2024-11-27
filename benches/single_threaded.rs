@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use slicebuf::expl_sync;
+use slicebuf::{expl_sync, lock_free_ringbuf};
 
 pub fn std_vecdeque(n: usize) {
     let mut buf = VecDeque::with_capacity(100);
@@ -28,6 +28,19 @@ pub fn explicit_sync(n: usize) {
         let len = 100;
         assert!(reader.slice_to(len).is_some());
         reader.consume(len);
+    }
+}
+
+pub fn single_alloc_lf_ringbuf(n: usize) {
+    let (mut sender, mut reader) = lock_free_ringbuf::create_bounded(n);
+
+    for i in 0..n {
+        while let Err(_) = sender.try_send(i) {}
+    }
+
+    for _ in 0..(n / 100) {
+        let len = 100;
+        assert_eq!(reader.read(len).len(), len);
     }
 }
 

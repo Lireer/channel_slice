@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration,
 };
-use slicebuf::expl_sync;
+use slicebuf::{expl_sync, lock_free_ringbuf};
 
 fn single_threaded(c: &mut Criterion) {
     let mut group = c.benchmark_group("single threaded");
@@ -19,6 +19,9 @@ fn single_threaded(c: &mut Criterion) {
     });
     group.bench_function("explicit sync (sa)", |b| {
         b.iter(|| single_threaded::single_alloc_explicit_sync(black_box(n)))
+    });
+    group.bench_function("lf ringbuf (sa)", |b| {
+        b.iter(|| single_threaded::single_alloc_lf_ringbuf(black_box(n)))
     });
     group.bench_function("std::VecDeque", |b| {
         b.iter(|| single_threaded::std_vecdeque(black_box(n)))
@@ -40,6 +43,9 @@ fn multi_threaded(c: &mut Criterion) {
         );
         group.bench_with_input(BenchmarkId::new("explicit sync (sa)", n), &n, |b, &n| {
             b.iter(|| multi_threaded::single_alloc_explicit_sync(black_box(n)))
+        });
+        group.bench_with_input(BenchmarkId::new("lf ringbuf (sa)", n), &n, |b, &n| {
+            b.iter(|| multi_threaded::single_alloc_lf_ringbuf(black_box(n)))
         });
         group.bench_with_input(BenchmarkId::new("Mutex<std::VecDeque>", n), &n, |b, &n| {
             b.iter(|| multi_threaded::std_vecdeque(black_box(n)))
@@ -68,11 +74,12 @@ fn realistic(c: &mut Criterion) {
         .map(|s| s as f32 / 1000.0)
         .cycle()
         .take(samples_size)
+        // no chunks or window methods on Iterator :'(
         .for_each(|sample| {
-            if samples.last().unwrap().len() < realistic::WRITE_SIZE {
+            if samples.last().unwrap().len() < realistic::INPUT_BLOCK_SIZE {
                 samples.last_mut().unwrap().push(sample);
             } else {
-                let mut new_vec = Vec::with_capacity(realistic::WRITE_SIZE);
+                let mut new_vec = Vec::with_capacity(realistic::INPUT_BLOCK_SIZE);
                 new_vec.push(sample);
                 samples.push(new_vec);
             }
@@ -95,6 +102,16 @@ fn realistic(c: &mut Criterion) {
             || samples.clone(),
             |mut samples| {
                 realistic::explicit_sync(&mut samples);
+                samples
+            },
+            criterion::BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("lf ringbuf", |b| {
+        b.iter_batched(
+            || samples.clone(),
+            |mut samples| {
+                realistic::lf_ringbuf(&mut samples);
                 samples
             },
             criterion::BatchSize::SmallInput,
@@ -228,6 +245,24 @@ fn push_multiple(c: &mut Criterion) {
                     |(mut writer, _reader, input)| {
                         writer.push_exact(input);
                         (writer, _reader)
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("push lf_ringbuf::Sender", n),
+            &n,
+            |b, &n| {
+                b.iter_batched(
+                    || {
+                        let (sender, receiver) = lock_free_ringbuf::create_bounded(n);
+                        let input = (0..n).collect::<Vec<_>>();
+                        (sender, receiver, input)
+                    },
+                    |(mut sender, _receiver, input)| {
+                        _ = sender.try_send_vec(input);
+                        (sender, _receiver)
                     },
                     criterion::BatchSize::SmallInput,
                 )

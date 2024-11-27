@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, sync::Arc, thread};
 
 use parking_lot::Mutex;
-use slicebuf::expl_sync;
+use slicebuf::{expl_sync, lock_free_ringbuf};
 
 pub fn std_vecdeque(n: usize) {
     let buf = Arc::new(Mutex::new(VecDeque::with_capacity(100)));
@@ -101,6 +101,30 @@ pub fn single_alloc_explicit_sync(n: usize) {
             }
         } else {
             reader.synchronize();
+        }
+    }
+}
+
+pub fn single_alloc_lf_ringbuf(n: usize) {
+    let (mut writer, mut reader) = lock_free_ringbuf::create_bounded(n);
+
+    thread::spawn(move || {
+        for i in 0..n {
+            // can't fail cause the buffer has the same capacity as the number of elements that will
+            // be pushed into it.
+            _ = writer.try_send(i);
+        }
+    });
+
+    let mut drained = 0;
+    let block_size = 100;
+    loop {
+        if reader.len() >= block_size {
+            reader.read(block_size);
+            drained += block_size;
+            if drained >= n {
+                break;
+            }
         }
     }
 }
