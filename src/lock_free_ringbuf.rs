@@ -3,6 +3,15 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SendError<T> {
+    /// There's not enough space in the buffer to send the value.
+    // #[error("Not enough space in the buffer to send the value.")]
+    Full(T),
+    /// The receiver has been dropped.
+    Dropped(T),
+}
+
 pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Inner::with_capacity(capacity);
     let buf_ptr: *const T = inner.buf;
@@ -43,6 +52,12 @@ pub struct Sender<T> {
     /// be written to.
     write_pos: *mut T,
 }
+
+// FIXME: Explain why these are safe and if they are even safe.
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Sync> Sync for Sender<T> {}
+unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl<T: Sync> Sync for Receiver<T> {}
 
 impl<T> Inner<T> {
     /// Creates a new `Inner` with the given capacity.
@@ -95,7 +110,7 @@ impl<T> Receiver<T> {
     /// ```
     pub fn len_without_wrap(&self) -> usize {
         let elements_to_end = unsafe { (*self.inner).end_of_buf().offset_from(self.read_pos) };
-        assert!(
+        debug_assert!(
             elements_to_end >= 0,
             "elements_to_end is negative ({}), end_of_buf: {:p}, read_pos: {:p}",
             elements_to_end,
@@ -150,7 +165,7 @@ impl<T> Receiver<T> {
         }
 
         let elems_to_end = unsafe { end_of_buf.offset_from(self.read_pos) };
-        assert!(
+        debug_assert!(
             elems_to_end >= 0,
             "elems_to_end is negative ({}), end_of_buf: {:p}, read_pos: {:p}",
             elems_to_end,
@@ -240,7 +255,7 @@ impl<T> Receiver<T> {
         if std::mem::size_of::<T>() != 0 {
             let end_of_buf = unsafe { &*self.inner }.end_of_buf();
             let elems_to_end = unsafe { end_of_buf.offset_from(self.read_pos) };
-            assert!(
+            debug_assert!(
                 elems_to_end >= 0,
                 "elems_to_end is negative ({}), end_of_buf: {:p}, read_pos: {:p}",
                 elems_to_end,
@@ -338,6 +353,10 @@ impl<T> Sender<T> {
         unsafe { &*self.inner }.len.load(Ordering::Acquire)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn capacity(&self) -> usize {
         unsafe { &*self.inner }.capacity
     }
@@ -345,7 +364,7 @@ impl<T> Sender<T> {
     pub fn space_to_end(&self) -> usize {
         let end_of_buf = unsafe { &*self.inner }.end_of_buf();
         let space_to_end = unsafe { end_of_buf.offset_from(self.write_pos) };
-        assert!(
+        debug_assert!(
             space_to_end >= 0,
             "space_to_end is negative ({}), end_of_buf: {:p}, write_pos: {:p}",
             space_to_end,
@@ -355,25 +374,33 @@ impl<T> Sender<T> {
         space_to_end as usize
     }
 
+    fn receiver_dropped(&self) -> bool {
+        unsafe { &*self.inner }
+            .counterpart_dropped
+            .load(Ordering::Acquire)
+    }
+
     /// Sends a value to the buffer, blocking until there is space.
     ///
     /// Also returns if the receiver has been dropped.
     ///
     /// blocking, lock-free
-    // TODO: Wrap T in an Error that also handles the `Receiver` being dropped.
-    // pub fn send(&mut self, t: T) -> Result<(), > {
+    // pub fn send(&mut self, t: T) -> Result<(), SendError<T>> {
     //     todo!()
     // }
 
     /// Sends a value to the buffer, immediately returning if there is no space.
     ///
-    /// non-blocking, lock-free
-    // TODO: Wrap T in an Error that also handles the `Receiver` being dropped.
-    pub fn try_send(&mut self, t: T) -> Result<(), T> {
+    /// non-blocking and lock-free
+    pub fn try_send(&mut self, t: T) -> Result<(), SendError<T>> {
+        if self.receiver_dropped() {
+            return Err(SendError::Dropped(t));
+        }
+
         let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
         let capacity = unsafe { &*self.inner }.capacity;
         if len == capacity {
-            return Err(t);
+            return Err(SendError::Full(t));
         }
 
         // SAFETY: We know that there is space in the buffer.
@@ -391,36 +418,110 @@ impl<T> Sender<T> {
         Ok(())
     }
 
-    /// Sends a slice to the buffer, immediately returning if there is no space.
+    /// Sends a slice to the buffer, immediately returning `vec` if there is no space.
     // non-blocking, lock-free
-    pub fn try_send_vec(&mut self, vec: Vec<T>) -> Result<(), Vec<T>> {
-        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
-        let capacity = unsafe { &*self.inner }.capacity;
-        if len + vec.len() > capacity {
-            return Err(vec);
+    pub fn try_send_vec(&mut self, mut vec: Vec<T>) -> Result<(), SendError<Vec<T>>> {
+        if self.receiver_dropped() {
+            return Err(SendError::Dropped(vec));
         }
 
-        let space_to_end = self.space_to_end();
-        let offset_from_start = unsafe { self.write_pos.offset_from((*self.inner).buf) };
-        assert!(
-            offset_from_start >= 0,
-            "offset_from_start is negative ({}), write_pos: {:p}, buf: {:p}",
-            offset_from_start,
-            self.write_pos,
-            unsafe { &*self.inner }.buf
-        );
-        let offset_from_start = offset_from_start as usize;
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        let capacity = unsafe { &*self.inner }.capacity;
+        let space_left = capacity - len;
 
-        todo!()
+        if vec.len() > space_left {
+            return Err(SendError::Full(vec));
+        }
+
+        let mut written = vec.len().min(self.space_to_end());
+        unsafe { std::ptr::copy_nonoverlapping(vec.as_ptr(), self.write_pos, written) };
+
+        // If less has been written than is in the vec...
+        if written < vec.len() {
+            // ... write whatever remains starting from the start of the buf.
+            let remaining = vec.len() - written;
+            // SAFETY: We know there is enough space, because of the above check that guarantees
+            //         the vec\s length to be less or equal to `capacity - len`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    vec.as_ptr().add(written),
+                    (*self.inner).buf.cast_mut(),
+                    remaining,
+                );
+            }
+            written += remaining;
+            self.write_pos = unsafe { (*self.inner).buf.cast_mut().add(remaining) };
+        } else if self.write_pos as *const _ == unsafe { &*self.inner }.end_of_buf() {
+            // Wrap around at the end of the buffer.
+            self.write_pos = unsafe { &*self.inner }.buf.cast_mut();
+        }
+
+        // Set the vec's length to 0 to prevent it from dropping the elements.
+        unsafe { vec.set_len(0) };
+        drop(vec);
+
+        unsafe { &*self.inner }
+            .len
+            .fetch_add(written, Ordering::AcqRel);
+
+        Ok(())
     }
 
     // non-blocking, lock-free
-    pub fn try_send_iter<I>(&mut self, iter: I) -> Result<(), I>
+    pub fn try_send_iter<I>(&mut self, iter: I) -> Result<(), SendError<I::IntoIter>>
     where
         I: IntoIterator<Item = T>,
         I::IntoIter: ExactSizeIterator,
     {
-        todo!()
+        if self.receiver_dropped() {
+            return Err(SendError::Dropped(iter.into_iter()));
+        }
+
+        let mut iter = iter.into_iter();
+        let iter_len = iter.len();
+
+        let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        let capacity = unsafe { &*self.inner }.capacity;
+        let space_left = capacity - len;
+
+        if iter_len > space_left {
+            return Err(SendError::Full(iter));
+        }
+
+        let write_to_end = iter_len.min(self.space_to_end());
+        for offset in 0..write_to_end {
+            unsafe {
+                std::ptr::write(self.write_pos.add(offset), iter.next().unwrap());
+            }
+        }
+
+        // If there's anything left in the iterator ...
+        if iter.len() > 0 {
+            // ... write whatever remains starting from the start of the buf.
+            self.write_pos = unsafe { &*self.inner }.buf.cast_mut();
+            for t in iter {
+                // SAFETY: We know that there is space in the buffer.
+                unsafe {
+                    std::ptr::write(self.write_pos, t);
+                }
+
+                self.write_pos = unsafe { self.write_pos.add(1) };
+            }
+        } else {
+            // There's nothing left to write, just update the write_pos to its final position.
+            self.write_pos = unsafe { self.write_pos.add(write_to_end) };
+            if self.write_pos as *const _ == unsafe { &*self.inner }.end_of_buf() {
+                // Wrap around at the end of the buffer.
+                self.write_pos = unsafe { &*self.inner }.buf.cast_mut();
+            }
+        }
+
+        let prev_len = unsafe { &*self.inner }
+            .len
+            .fetch_add(iter_len, Ordering::AcqRel);
+        debug_assert!(prev_len + iter_len <= capacity);
+
+        Ok(())
     }
 }
 
@@ -430,7 +531,7 @@ impl<T> Sender<T> {
 impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
         // Check that all elements have been removed.
-        assert_eq!(
+        debug_assert_eq!(
             self.len.load(Ordering::Relaxed),
             0,
             "Not all elements have been removed."
@@ -485,7 +586,7 @@ impl<T> Drop for Sender<T> {
             // Use `Acquire` here to make sure we get the latest value of the buffers length.
             let len = inner.len.load(Ordering::Acquire);
             let offset_from_start = unsafe { self.write_pos.offset_from(inner.buf) };
-            assert!(
+            debug_assert!(
                 offset_from_start >= 0,
                 "offset_from_start is negative ({}), write_pos: {:p}, buf: {:p}",
                 offset_from_start,

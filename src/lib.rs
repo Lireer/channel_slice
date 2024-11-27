@@ -1,4 +1,6 @@
-pub mod bounded;
+#![deny(unsafe_op_in_unsafe_fn)]
+
+// pub mod bounded;
 pub mod expl_sync;
 pub mod lock_free_ringbuf;
 
