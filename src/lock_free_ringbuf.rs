@@ -221,7 +221,7 @@ impl<T> Receiver<T> {
     /// Reads and removes exactly `n` elements from the front of the buffer.
     ///
     /// Returns
-    pub fn read_exact(&self, n: usize) -> Result<&[T], usize> {
+    pub fn read_exact(&mut self, n: usize) -> Result<&[T], usize> {
         todo!()
     }
 

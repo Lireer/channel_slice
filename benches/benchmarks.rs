@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, PlotConfiguration,
 };
-use slicebuf::{expl_sync, lock_free_ringbuf};
+use slicebuf::lock_free_ringbuf;
 
 fn single_threaded(c: &mut Criterion) {
     let mut group = c.benchmark_group("single threaded");
@@ -17,17 +17,11 @@ fn single_threaded(c: &mut Criterion) {
     group.bench_function("std::VecDeque (sa)", |b| {
         b.iter(|| single_threaded::single_alloc_std_vecdeque(black_box(n)))
     });
-    group.bench_function("explicit sync (sa)", |b| {
-        b.iter(|| single_threaded::single_alloc_explicit_sync(black_box(n)))
-    });
     group.bench_function("lf ringbuf (sa)", |b| {
         b.iter(|| single_threaded::single_alloc_lf_ringbuf(black_box(n)))
     });
     group.bench_function("std::VecDeque", |b| {
         b.iter(|| single_threaded::std_vecdeque(black_box(n)))
-    });
-    group.bench_function("explicit sync", |b| {
-        b.iter(|| single_threaded::explicit_sync(black_box(n)))
     });
     group.finish();
 }
@@ -41,17 +35,11 @@ fn multi_threaded(c: &mut Criterion) {
             &n,
             |b, &n| b.iter(|| multi_threaded::single_alloc_std_vecdeque(black_box(n))),
         );
-        group.bench_with_input(BenchmarkId::new("explicit sync (sa)", n), &n, |b, &n| {
-            b.iter(|| multi_threaded::single_alloc_explicit_sync(black_box(n)))
-        });
         group.bench_with_input(BenchmarkId::new("lf ringbuf (sa)", n), &n, |b, &n| {
             b.iter(|| multi_threaded::single_alloc_lf_ringbuf(black_box(n)))
         });
         group.bench_with_input(BenchmarkId::new("Mutex<std::VecDeque>", n), &n, |b, &n| {
             b.iter(|| multi_threaded::std_vecdeque(black_box(n)))
-        });
-        group.bench_with_input(BenchmarkId::new("explicit sync", n), &n, |b, &n| {
-            b.iter(|| multi_threaded::explicit_sync(black_box(n)))
         });
     }
 
@@ -97,16 +85,6 @@ fn realistic(c: &mut Criterion) {
             criterion::BatchSize::SmallInput,
         )
     });
-    group.bench_function("explicit sync", |b| {
-        b.iter_batched(
-            || samples.clone(),
-            |mut samples| {
-                realistic::explicit_sync(&mut samples);
-                samples
-            },
-            criterion::BatchSize::SmallInput,
-        )
-    });
     group.bench_function("lf ringbuf", |b| {
         b.iter_batched(
             || samples.clone(),
@@ -134,7 +112,7 @@ fn realistic(c: &mut Criterion) {
         b.iter_batched(
             || samples.clone(),
             |mut samples| {
-                realistic::explicit_sync_do_work(&mut samples);
+                realistic::lf_ringbuf_do_work(&mut samples);
                 samples
             },
             criterion::BatchSize::SmallInput,
@@ -162,7 +140,8 @@ fn basic_operations(c: &mut Criterion) {
         b.iter_batched(
             || VecDeque::from_iter(0..100),
             |mut deque| {
-                _ = deque.make_contiguous()[0..20];
+                let s = &deque.make_contiguous()[0..20];
+                std::hint::black_box(s);
                 deque
             },
             criterion::BatchSize::SmallInput,
@@ -172,52 +151,54 @@ fn basic_operations(c: &mut Criterion) {
         b.iter_batched(
             || VecDeque::from_iter(0..10),
             |mut deque| {
-                deque.pop_front();
+                let a = deque.pop_front();
+                std::hint::black_box(a);
                 deque
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    group.bench_function("push expl_sync::SliceBuf", |b| {
+    group.bench_function("push lf_ringbuf::Writer", |b| {
         b.iter_batched(
-            || expl_sync::SliceBuf::with_capacity(1).split(),
-            |(mut writer, reader)| {
-                writer.push(black_box(1.0));
-                (writer, reader)
+            || lock_free_ringbuf::create_bounded(1),
+            |(mut sender, recv)| {
+                let s = sender.try_send(black_box(1.0));
+                std::hint::black_box(s);
+                (sender, recv)
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    group.bench_function("slice expl_sync::SliceBuf", |b| {
+    group.bench_function("slice lf_ringbuf::Writer", |b| {
         b.iter_batched(
             || {
                 let n = 100;
-                let (mut writer, reader) = expl_sync::SliceBuf::with_capacity(n).split();
+                let (mut sender, recv) = lock_free_ringbuf::create_bounded(n);
                 for i in 0..n {
-                    writer.push(i);
+                    sender.try_send(i);
                 }
-                (writer, reader)
+                (sender, recv)
             },
-            |(_writer, reader)| {
-                _ = reader.slice_to(20);
-                (_writer, reader)
+            |(_sender, recv)| {
+                let s = recv.peek_cow_exact(std::hint::black_box(20));
+                std::hint::black_box(s);
+                (_sender, recv)
             },
             criterion::BatchSize::SmallInput,
         )
     });
-    group.bench_function("pop expl_sync::SliceBuf", |b| {
+    group.bench_function("pop lf_ringbuf::Writer", |b| {
         b.iter_batched(
             || {
                 let n = 10;
-                let (mut writer, reader) = expl_sync::SliceBuf::with_capacity(n).split();
-                for i in 0..n {
-                    writer.push(i);
-                }
-                (writer, reader)
+                let (mut sender, recv) = lock_free_ringbuf::create_bounded(n);
+                sender.try_send_iter(0..n);
+                (sender, recv)
             },
-            |(_writer, mut reader)| {
-                reader.consume(1);
-                (_writer, reader)
+            |(_sender, mut recv)| {
+                let a = recv.read(1);
+                std::hint::black_box(a);
+                (_sender, recv)
             },
             criterion::BatchSize::SmallInput,
         )
@@ -232,24 +213,6 @@ fn push_multiple(c: &mut Criterion) {
     group.plot_config(plot_config);
 
     for n in [100, 10_000, 1_000_000] {
-        group.bench_with_input(
-            BenchmarkId::new("push expl_sync::SliceBuf", n),
-            &n,
-            |b, &n| {
-                b.iter_batched(
-                    || {
-                        let (writer, reader) = expl_sync::SliceBuf::with_capacity(n).split();
-                        let input = (0..n).collect::<Vec<_>>();
-                        (writer, reader, input)
-                    },
-                    |(mut writer, _reader, input)| {
-                        writer.push_exact(input);
-                        (writer, _reader)
-                    },
-                    criterion::BatchSize::SmallInput,
-                )
-            },
-        );
         group.bench_with_input(
             BenchmarkId::new("push lf_ringbuf::Sender", n),
             &n,

@@ -1,10 +1,7 @@
 use std::{collections::VecDeque, sync::Arc, thread};
 
 use parking_lot::Mutex;
-use slicebuf::{
-    expl_sync,
-    lock_free_ringbuf::{self, SendError},
-};
+use slicebuf::lock_free_ringbuf::{self, SendError};
 
 // The use case we're benchmarking here is processing of audio samples.
 //
@@ -45,42 +42,6 @@ pub fn std_vecdeque(samples: &mut Vec<Vec<f32>>) {
                 .spawn(|| {
                     while let Some(block) = samples.pop() {
                         buf.lock().extend(block);
-                    }
-                })
-                .join()
-                .unwrap();
-        }
-    });
-
-    reader_handle.join().unwrap();
-}
-
-pub fn explicit_sync(samples: &mut Vec<Vec<f32>>) {
-    let (mut writer, mut reader) =
-        expl_sync::SliceBuf::<f32>::with_capacity(INITIAL_BUFFER_SIZE).split();
-
-    let reader_handle = thread::spawn({
-        let mut drained = 0;
-        let limit = samples.len() * INPUT_BLOCK_SIZE;
-        move || loop {
-            if let Some(slice) = reader.slice_to(READ_SIZE) {
-                drained += slice.len();
-                reader.consume(slice.len());
-                if drained >= limit {
-                    break;
-                }
-            } else {
-                reader.synchronize();
-            }
-        }
-    });
-
-    thread::scope({
-        |scope| {
-            scope
-                .spawn(|| {
-                    while let Some(block) = samples.pop() {
-                        writer.push_vec(block);
                     }
                 })
                 .join()
@@ -209,9 +170,8 @@ pub fn std_vecdeque_do_work(samples: &mut Vec<Vec<f32>>) {
     reader_handle.join().unwrap();
 }
 
-pub fn explicit_sync_do_work(samples: &mut Vec<Vec<f32>>) {
-    let (mut writer, mut reader) =
-        expl_sync::SliceBuf::<f32>::with_capacity(INITIAL_BUFFER_SIZE).split();
+pub fn lf_ringbuf_do_work(samples: &mut Vec<Vec<f32>>) {
+    let (mut sender, mut receiver) = lock_free_ringbuf::create_bounded(INITIAL_BUFFER_SIZE);
 
     let reader_handle = thread::spawn({
         // Try to process as many samples as possible but subtract READ_SIZE to avoid edge cases.
@@ -226,7 +186,7 @@ pub fn explicit_sync_do_work(samples: &mut Vec<Vec<f32>>) {
             if expensive_mode {
                 spin_sleep::sleep(std::time::Duration::from_micros(40));
                 let read_until = read + READ_SIZE / 2;
-                if let Some(buf) = reader.slice_to(read_until) {
+                if let Ok(buf) = receiver.peek_cow_exact(read_until) {
                     // Check if the average is now below -0.75, ...
                     if avg(&buf[read..read_until]) < -0.5 {
                         // if so, switch to non-expensive mode, draining all samples until read_until.
@@ -234,22 +194,20 @@ pub fn explicit_sync_do_work(samples: &mut Vec<Vec<f32>>) {
                         expensive_mode = !expensive_mode;
                         let len = buf.len();
                         drained += len;
-                        reader.consume(len);
+                        _ = receiver.read_exact(len);
                         read = 0;
                     } else {
                         // else just increase read.
                         read = read_until;
                     }
-                } else {
-                    reader.synchronize();
                 }
             } else {
                 // read is always 0 at this point because it's reset after switching and when already in this mode it's
                 // never increased.
-                if let Some(buf) = reader.slice_to(READ_SIZE) {
+                if let Ok(buf) = receiver.peek_cow_exact(READ_SIZE) {
                     spin_sleep::sleep(std::time::Duration::from_micros(10));
                     // Check if the average is above 0.75, ...
-                    if avg(buf) > 0.4 {
+                    if avg(buf.as_ref()) > 0.4 {
                         // if so, switch to expensive mode and mark these samples as already read.
                         expensive_mode = !expensive_mode;
                         read = READ_SIZE;
@@ -257,10 +215,8 @@ pub fn explicit_sync_do_work(samples: &mut Vec<Vec<f32>>) {
                         // else advance the window by half of READ_SIZE.
                         let len = READ_SIZE / 2;
                         drained += len;
-                        reader.consume(len);
+                        while let Err(_) = receiver.read_exact(len) {}
                     }
-                } else {
-                    reader.synchronize();
                 }
             }
             if drained >= limit {
@@ -273,8 +229,10 @@ pub fn explicit_sync_do_work(samples: &mut Vec<Vec<f32>>) {
         |scope| {
             scope
                 .spawn(|| {
-                    while let Some(block) = samples.pop() {
-                        writer.push_vec(block);
+                    while let Some(mut block) = samples.pop() {
+                        while let Err(SendError::Full(b)) = sender.try_send_vec(block) {
+                            block = b;
+                        }
                     }
                 })
                 .join()
