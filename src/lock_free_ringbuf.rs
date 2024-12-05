@@ -67,7 +67,7 @@ impl<T> Inner<T> {
     /// Panics if `capacity` is big enough to cause an the buffer's size to be bigger than
     /// `isize::MAX` if rounded up to the nearest multiple of `T`'s alignment.
     fn with_capacity(capacity: usize) -> Self {
-        let layout = std::alloc::Layout::array::<T>(capacity).unwrap();
+        let layout = Self::layout(capacity);
         let buf: *mut T = unsafe { std::alloc::alloc(layout) }.cast();
         if buf.is_null() {
             std::alloc::handle_alloc_error(layout);
@@ -79,6 +79,10 @@ impl<T> Inner<T> {
             len: AtomicUsize::new(0),
             counterpart_dropped: AtomicBool::new(false),
         }
+    }
+
+    fn layout(capacity: usize) -> std::alloc::Layout {
+        std::alloc::Layout::array::<T>(capacity).unwrap()
     }
 
     fn capacity(&self) -> usize {
@@ -537,9 +541,8 @@ impl<T> Drop for Inner<T> {
             "Not all elements have been removed."
         );
 
-        let layout = std::alloc::Layout::array::<T>(self.capacity).unwrap();
         unsafe {
-            std::alloc::dealloc(self.buf.cast_mut().cast(), layout);
+            std::alloc::dealloc(self.buf.cast_mut().cast(), Self::layout(self.capacity()));
         }
     }
 }
@@ -553,11 +556,12 @@ impl<T> Drop for Receiver<T> {
 
         // If the writer has been dropped, it falls upon the reader to clean up the memory.
         if counterpart_dropped {
-            // SAFETY: The writer has been dropped, so it's safe to drop `inner`.
-            let inner = unsafe { Box::from_raw(self.inner.cast_mut()) };
-
             // Drop elements in the buffer. This handles T being a ZST as well.
             self.clear();
+
+            // SAFETY: The writer has been dropped and all elements have been removed, so it's safe
+            //         to drop `inner`.
+            let inner = unsafe { Box::from_raw(self.inner.cast_mut()) };
 
             drop(inner);
         }
@@ -593,9 +597,9 @@ impl<T> Drop for Sender<T> {
                 self.write_pos,
                 inner.buf
             );
-
             let offset_from_start = offset_from_start as usize;
-            if offset_from_start <= len {
+
+            if offset_from_start >= len {
                 // Case 1: All elements are contiguous in memory.
                 unsafe {
                     std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
@@ -631,5 +635,55 @@ impl<T> Drop for Sender<T> {
             // Drop `inner` explicitly and let it take care of freeing the buffer's memory.
             drop(inner);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn create_bounded_works() {
+        let (sender, receiver) = create_bounded::<i32>(4);
+        assert_eq!(sender.capacity(), 4);
+        assert_eq!(receiver.len(), 0);
+    }
+
+    #[test]
+    fn drop_sender_then_receiver() {
+        let (sender, receiver) = create_bounded::<i32>(4);
+        drop(sender);
+        assert_eq!(receiver.len(), 0);
+        drop(receiver);
+    }
+
+    #[test]
+    fn drop_receiver_then_sender() {
+        let (sender, receiver) = create_bounded::<i32>(4);
+        drop(receiver);
+        assert_eq!(sender.len(), 0);
+        drop(sender);
+    }
+
+    #[test]
+    fn elements_dropped_correctly() {
+        let (mut sender, mut receiver) = create_bounded(4);
+
+        let elems: Vec<_> = [0, 1, 2, 3, 4, 5].into_iter().map(Arc::new).collect();
+
+        sender.try_send_iter(elems[0..4].iter().cloned()).unwrap();
+        assert!(elems[0..4].iter().all(|e| Arc::strong_count(e) == 2));
+
+        receiver.read(2);
+        sender.try_send_iter(elems[4..].iter().cloned()).unwrap();
+        assert!(elems[0..2].iter().all(|e| Arc::strong_count(e) == 1));
+        assert!(elems[2..].iter().all(|e| Arc::strong_count(e) == 2));
+
+        drop(receiver);
+        assert!(elems[2..].iter().all(|e| Arc::strong_count(e) == 2));
+        drop(sender);
+        assert!(elems.iter().all(|e| Arc::strong_count(e) == 1));
     }
 }
