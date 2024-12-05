@@ -196,7 +196,7 @@ fn basic_operations(c: &mut Criterion) {
                 (sender, recv)
             },
             |(_sender, mut recv)| {
-                let a = recv.read(1);
+                let a = recv.recv_up_to(1);
                 std::hint::black_box(a);
                 (_sender, recv)
             },

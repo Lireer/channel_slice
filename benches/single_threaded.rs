@@ -23,7 +23,7 @@ pub fn single_alloc_lf_ringbuf(n: usize) {
 
     for _ in 0..(n / 100) {
         let len = 100;
-        assert_eq!(reader.read(len).len(), len);
+        assert_eq!(reader.recv_up_to(len).len(), len);
     }
 }
 

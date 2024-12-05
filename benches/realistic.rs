@@ -61,7 +61,7 @@ pub fn lf_ringbuf(samples: &mut Vec<Vec<f32>>) {
         move || {
             while drained < limit {
                 if recv.len() >= READ_SIZE {
-                    drained += recv.read(READ_SIZE).len();
+                    drained += recv.recv_up_to(READ_SIZE).len();
                 }
             }
         }

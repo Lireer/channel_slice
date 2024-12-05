@@ -6,10 +6,17 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SendError<T> {
     /// There's not enough space in the buffer to send the value.
-    // #[error("Not enough space in the buffer to send the value.")]
+    #[error("Not enough space in the buffer to send the value.")]
     Full(T),
     /// The receiver has been dropped.
+    #[error("The receiver has been dropped, no further values can be sent.")]
     Dropped(T),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecvError {
+    #[error("The sender has been dropped, there are {0} elements that can still be received.")]
+    Dropped(usize),
 }
 
 pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
@@ -155,7 +162,7 @@ impl<T> Receiver<T> {
     ///
     /// Lock-free and non-blocking.
     // TODO: Check if the writer part has been dropped.
-    pub fn read(&mut self, n: usize) -> Vec<T> {
+    pub fn recv_up_to(&mut self, n: usize) -> Vec<T> {
         let end_of_buf = unsafe { &*self.inner }.end_of_buf();
         // There are two scenarios to consider:
         // 1. The next n elements are contiguous in memory.
@@ -642,6 +649,8 @@ impl<T> Drop for Sender<T> {
 mod tests {
     use std::sync::Arc;
 
+    use testresult::TestResult;
+
     use super::*;
 
     #[test]
@@ -668,16 +677,39 @@ mod tests {
     }
 
     #[test]
-    fn elements_dropped_correctly() {
+    fn send_fails_after_receiver_drop() -> TestResult {
+        let (mut sender, receiver) = create_bounded(4);
+        sender.try_send(0)?;
+        drop(receiver);
+
+        assert_eq!(sender.try_send(1), Err(SendError::Dropped(1)));
+        assert_eq!(
+            sender.try_send_vec(vec![2, 3]),
+            Err(SendError::Dropped(vec![2, 3]))
+        );
+
+        let err = sender.try_send_iter(vec![4, 5].into_iter());
+        let Err(SendError::Dropped(iter)) = err else {
+            panic!("Didn't error because the receiver was dropped");
+        };
+        assert_eq!(iter.collect::<Vec<_>>(), vec![4, 5]);
+
+        assert_eq!(sender.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn elements_dropped_correctly() -> TestResult {
         let (mut sender, mut receiver) = create_bounded(4);
 
-        let elems: Vec<_> = [0, 1, 2, 3, 4, 5].into_iter().map(Arc::new).collect();
+        let elems: Vec<Arc<_>> = [0, 1, 2, 3, 4, 5].into_iter().map(Arc::new).collect();
 
-        sender.try_send_iter(elems[0..4].iter().cloned()).unwrap();
+        sender.try_send_iter(elems[0..4].iter().cloned())?;
         assert!(elems[0..4].iter().all(|e| Arc::strong_count(e) == 2));
 
-        receiver.read(2);
-        sender.try_send_iter(elems[4..].iter().cloned()).unwrap();
+        receiver.recv_up_to(2);
+        sender.try_send_iter(elems[4..].iter().cloned())?;
         assert!(elems[0..2].iter().all(|e| Arc::strong_count(e) == 1));
         assert!(elems[2..].iter().all(|e| Arc::strong_count(e) == 2));
 
@@ -685,5 +717,94 @@ mod tests {
         assert!(elems[2..].iter().all(|e| Arc::strong_count(e) == 2));
         drop(sender);
         assert!(elems.iter().all(|e| Arc::strong_count(e) == 1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn send_and_receive_entire_buffer() -> TestResult {
+        let (mut sender, mut receiver) = create_bounded(3);
+        sender.try_send_vec(vec![0, 1, 2])?;
+        assert_eq!(receiver.recv_up_to(3), vec![0, 1, 2]);
+        assert_eq!(receiver.len(), 0);
+        assert_eq!(sender.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn failure_from_previous_impl() -> TestResult {
+        let (mut s, mut r) = create_bounded::<u32>(3);
+        // _ _ _
+        s.try_send(0)?;
+        // 0 _ _
+        s.try_send(1)?;
+        // 0 1 _
+        s.try_send(2)?;
+        // 0 1 2   len: 3
+        assert_eq!(r.recv_up_to(1), vec![0]);
+        // _ 1 2   len: 2
+        s.try_send(3)?;
+        // 3 1 2   len: 3
+        assert_eq!(r.recv_up_to(1), vec![1]);
+        // 3 _ 2   len: 2
+        s.try_send(4)?;
+        // 3 4 2   len: 3
+        assert_eq!(r.recv_up_to(1), vec![2]);
+        // 3 4 _   len: 2
+        assert_eq!(r.recv_up_to(1), vec![3]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_send_into_full_buffer_returns_error() -> TestResult {
+        let (mut sender, _receiver) = create_bounded(2);
+
+        // Fill the entire buffer
+        sender.try_send(0)?;
+        sender.try_send(1)?;
+        assert_eq!(sender.len(), 2);
+
+        // Test `try_send`
+        let err = sender.try_send(3);
+        assert_eq!(err, Err(SendError::Full(3)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_send_vec_into_full_buffer_returns_error() -> TestResult {
+        let (mut sender, _receiver) = create_bounded(2);
+
+        // Fill the entire buffer
+        sender.try_send(0)?;
+        assert_eq!(sender.len(), 1);
+
+        // Test `try_send_vec`
+        let vec = vec![2, 3];
+        let err = sender.try_send_vec(vec.clone());
+        assert_eq!(err, Err(SendError::Full(vec)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn try_send_iter_into_full_buffer_returns_error() -> TestResult {
+        let (mut sender, _receiver) = create_bounded(2);
+
+        // Fill the entire buffer
+        sender.try_send(0)?;
+        assert_eq!(sender.len(), 1);
+
+        // Test `try_send_iter`
+        let vec = vec![2, 3];
+        let err = sender.try_send_iter(vec.clone()).unwrap_err();
+        let SendError::Full(iter) = err else {
+            panic!("Didn't error because the buffer is full");
+        };
+        assert_eq!(iter.into_iter().collect::<Vec<_>>(), vec);
+
+        Ok(())
     }
 }

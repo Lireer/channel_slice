@@ -70,7 +70,7 @@ pub fn single_alloc_lf_ringbuf(n: usize) {
     let block_size = 100;
     loop {
         if reader.len() >= block_size {
-            reader.read(block_size);
+            reader.recv_up_to(block_size);
             drained += block_size;
             if drained >= n {
                 break;
