@@ -132,31 +132,43 @@ impl<T> Receiver<T> {
         len.min(elements_to_end as usize)
     }
 
-    /// Retunrs whether the buffer is empty.
+    /// Returns whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    // TODO: Instead maybe switch to these methods:
-    // read -> 0 to n elements
-    // read_exact -> exactly n elements, blocking until they are available
-    // try_read_exact -> exactly n elements, non-blocking
+
+    // The following methods have to:
+    // - Handle ZSTs
+    // - Drop elements correctly
+    // - Check if the writer has been dropped
     //
-    // peek -> 0 to n elements
-    // peek_exact -> exactly n elements, blocking until they are available or return an error if impossible
-    // try_peek_exact -> exactly n elements, non-blocking, return an error if impossible
+    // recv -> exactly n elements, blocking until they are available
+    // recv_up_to -> 0 to n elements
+    // try_recv -> exactly n elements, non-blocking
+    // recv_unchecked -> exactly n elements without checking the buffer's length
     //
+    // recv_into -> read exactly n elements into a buffer, blocking until they are available
+    // recv_into_up_to -> read into a buffer
+    // try_recv_into -> read exactly n elements into a buffer, non-blocking
+    // recv_into_unchecked -> read exactly n elements into a buffer without checking the reader's length
     //
-    // read_into -> read into a buffer
-    // read_into_exact -> read exactly n elements into a buffer, blocking until they are available
-    // try_read_into_exact -> read exactly n elements into a buffer, non-blocking
-    // read_into_unchecked -> read exactly n elements into a buffer without checking the reader's length
+    // peek_cow -> exactly n elements, blocking until they are available or return an error if impossible
+    // peek_cow_up_to -> 0 to n elements
+    // try_peek_cow -> exactly n elements, non-blocking, return an error if impossible
     //
     // clear
-    // remove -> remove up to n elements
-    // remove_exact -> remove exactly n elements, blocking until they are available
-    // try_remove_exact -> remove exactly n elements, non-blocking
+    // remove -> remove exactly n elements, blocking until they are available
+    // remove_up_to -> remove up to n elements
+    // try_remove -> remove exactly n elements, non-blocking
     // remove_unchecked -> remove exactly n elements without checking the buffer's length
+
+    /// Reads and removes exactly `n` elements from the front of the buffer.
+    ///
+    /// Blocks until there are at least `n` elements available.
+    pub fn recv(&mut self, n: usize) -> Result<Vec<T>, ()> {
+        todo!()
+    }
 
     /// Reads and removes up to `n` elements from the front of the buffer.
     ///
@@ -229,10 +241,61 @@ impl<T> Receiver<T> {
         output
     }
 
-    /// Reads and removes exactly `n` elements from the front of the buffer.
+    /// Tries to read and remove exactly `n` elements from the front of the buffer.
     ///
-    /// Returns
-    pub fn read_exact(&mut self, n: usize) -> Result<&[T], usize> {
+    /// Returning immediately with an error containing the number of currently available elements,
+    /// if there are fewer than `n` elements in the buffer.
+    pub fn try_recv(&mut self, n: usize) -> Result<Vec<T>, usize> {
+        todo!()
+    }
+
+    /// Reads and removes exactly `n` elements from the front of the buffer without checking the
+    /// buffer's length.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `n <= self.len()`, else uninitialized memory will be read.
+    ///
+    pub unsafe fn recv_unchecked(&mut self, n: usize) -> Result<Vec<T>, RecvError> {
+        todo!()
+    }
+
+    /// Reads and removes `n` elements from the front of the buffer and appends them to `buf`, blocking
+    ///
+    /// Blocks until there are `n` elements available.
+    pub fn recv_into(&mut self, n: usize, buf: &mut Vec<T>) {
+        todo!()
+    }
+
+    /// Reads and removes up to `n` elements from the front of the buffer and appends them to
+    /// `buf`.
+    ///
+    /// Returns the number of elements removed.
+    ///
+    /// Lock-free and non-blocking.
+    pub fn recv_into_up_to(&mut self, n: usize, buf: &mut Vec<T>) -> usize {
+        todo!()
+    }
+
+    /// Tries to read and remove `n` elements from the front of the buffer and append them to `buf`.
+    ///
+    /// Returns immediately with an error containing the number of currently available elements, if
+    /// there are fewer than `n` elements in the buffer.
+    pub fn try_recv_into(&mut self, n: usize, buf: &mut Vec<T>) -> Result<(), usize> {
+        todo!()
+    }
+
+    /// Reads and removes `n` elements from the front of the buffer and appends them to `buf` without
+    /// checking the buffer's length.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `n <= self.len()`, else uninitialized memory will be read.
+    pub unsafe fn recv_into_unchecked(
+        &mut self,
+        n: usize,
+        buf: &mut Vec<T>,
+    ) -> Result<(), RecvError> {
         todo!()
     }
 
@@ -240,20 +303,33 @@ impl<T> Receiver<T> {
     //     todo!()
     // }
 
-    // pub fn read_into(&self, n: usize, buf: &mut Vec<T>) {
-    //     todo!()
-    // }
+    /// Removes `n` elements from the front of the buffer, blocking if there are fewer than `n` elements.
+    pub fn remove(&mut self, n: usize) -> Result<(), RecvError> {
+        todo!()
+    }
 
     /// Removes up to `n` elements from the front of the buffer.
     ///
     /// Returns the number of elements removed.
-    pub fn remove(&mut self, n: usize) -> usize {
+    pub fn remove_up_to(&mut self, n: usize) -> Result<usize, RecvError> {
         let len = unsafe { &*self.inner }.len.load(Ordering::Acquire);
+        if len == 0 {
+            return Err(RecvError::Dropped(0));
+        }
+
         let elems_to_remove = n.min(len);
         unsafe {
             self.remove_unchecked(elems_to_remove);
         }
-        elems_to_remove
+        Ok(elems_to_remove)
+    }
+
+    /// Tries to remove `n` elements from the front of the buffer.
+    ///
+    /// Returns immediately with an error containing the number of currently available elements, if
+    /// there are fewer than `n` elements in the buffer.
+    pub fn try_remove(&mut self, n: usize) -> Result<(), usize> {
+        todo!()
     }
 
     /// Removes `n` elements from the front of the buffer wihtout checking the buffer's length.
@@ -342,19 +418,30 @@ impl<T> Receiver<T>
 where
     T: Copy,
 {
+    /// Peeks at the next `n` elements of the buffer, blocking if there are fewer than `n` elements.
+    ///
+    /// The return value is [`Cow::Borrowed`] if the elements are contiguous in memory, else they
+    /// are copied into a [`Vec`] and returned as [`Cow::Owned`] to make them contiguous.
+    pub fn peek_cow(&self, n: usize) -> Result<Cow<'_, [T]>, usize> {
+        todo!()
+    }
+
     /// Peeks at the next `n` elements in the buffer.
     ///
     /// If there are fewer than `n` elements in the buffer, all of them will be returned. The return
     /// value is [`Cow::Borrowed`] if the elements are contiguous in memory, else they are copied
     /// into a [`Vec`] and returned as [`Cow::Owned`] to make them contiguous.
-    pub fn peek_cow(&self, n: usize) -> Cow<'_, [T]> {
+    pub fn peek_cow_up_to(&self, n: usize) -> Cow<'_, [T]> {
         todo!()
     }
 
-    /// Peeks at exactly `n` elements at the start of the buffer.
+    /// Tries to peek at the next `n` elements at the start of the buffer.
     ///
-    /// If there are fewer than `n` elements in the buffer, their number is returned as an error.
-    pub fn peek_cow_exact(&self, n: usize) -> Result<Cow<'_, [T]>, usize> {
+    /// Returns immediately with an error containing the number of currently available elements, if
+    /// there are fewer than `n` elements in the buffer. The return value is [`Cow::Borrowed`] if
+    /// the elements are contiguous in memory, else they are copied into a [`Vec`] and returned as
+    /// [`Cow::Owned`] to make them contiguous.
+    pub fn try_peek_cow(&self, n: usize) -> Result<Cow<'_, [T]>, usize> {
         todo!()
     }
 }
