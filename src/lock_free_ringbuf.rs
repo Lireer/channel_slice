@@ -108,10 +108,11 @@ impl<T> Receiver<T> {
         unsafe { &*self.inner }.len.load(Ordering::Acquire)
     }
 
-    /// Returns the number of continguous elements starting from the [`Receiver`]'s current position.
+    /// Returns the number of continguous elements starting from the [`Receiver`]'s current
+    /// position.
     ///
-    /// In the following case, the length without wrap would be 5 since the values from `3` through
-    /// `7` could be read contiguously:
+    /// In the following case, the number of continuous elements would be 5 since the values from
+    /// `3` through `7` could be read contiguously:
     ///
     /// ```txt
     /// 8 _ _ 3 4 5 6 7
@@ -119,7 +120,7 @@ impl<T> Receiver<T> {
     ///       ↑
     ///       Receiver position
     /// ```
-    pub fn len_without_wrap(&self) -> usize {
+    pub fn contiguous_len(&self) -> usize {
         let elements_to_end = unsafe { (*self.inner).end_of_buf().offset_from(self.read_pos) };
         debug_assert!(
             elements_to_end >= 0,
@@ -136,7 +137,6 @@ impl<T> Receiver<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
 
     // The following methods have to:
     // - Handle ZSTs
