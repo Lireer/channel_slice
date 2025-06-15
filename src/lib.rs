@@ -5,6 +5,8 @@ use std::ops::RangeInclusive;
 // pub mod bounded;
 // pub mod expl_sync;
 pub mod lock_free_ringbuf;
+pub mod rtrb;
+pub mod simple_internals;
 
 pub trait SliceChannelReceiver<T> {
     type Slice<'a>: AsRef<[T]>
@@ -17,14 +19,15 @@ pub trait SliceChannelReceiver<T> {
     ///
     /// Implementors of this trait should panic if the end of the range is greater than `Self`'s
     /// capacity.
-    fn slice(&mut self, range: RangeInclusive<usize>) -> Self::Slice<'_>;
+    // TODO: Replace `Range` with `std::ops::RangeBounds`.
+    fn slice(&mut self, range: Range<usize>) -> Self::Slice<'_>;
     /// Remove the next `n` elements and append them to `buf`, blocking if not enough elements are
     /// available.
     ///
     /// # Panics
     ///
     /// Implementors of this trait should panic if `n` is greater than `Self`'s capacity.
-    fn pop_slice(&mut self, n: usize, buf: &mut Vec<T>) -> Vec<T>;
+    fn pop(&mut self, n: usize, buf: &mut Vec<T>);
     /// Consume the next `n` elements, blocking if less than `n` elements are available.
     ///
     /// # Panics
@@ -37,7 +40,8 @@ pub trait SliceChannelReceiver<T> {
     ///
     /// Returns `Err(usize)` if there are not enough elements in `Self` with the value indicating
     /// how many more elements have to be in `Self` for the same call to succeed.
-    fn try_slice(&mut self, range: RangeInclusive<usize>) -> Result<Self::Slice<'_>, usize>;
+    // TODO: Replace `Range` with `std::ops::RangeBounds`.
+    fn try_slice(&mut self, range: Range<usize>) -> Result<Self::Slice<'_>, usize>;
     fn try_pop(&mut self, n: usize, buf: &mut Vec<T>) -> Result<(), usize>;
     /// Consume and drop the next `n` elements in the buffer.
     ///
@@ -79,4 +83,23 @@ pub trait SliceChannelSender<T> {
     where
         D: IntoIterator<Item = T>,
         D::IntoIter: ExactSizeIterator;
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use crate::simple_internals::create_simple_channel;
+    use crate::{SliceChannelReceiver, SliceChannelSender};
+
+    #[test]
+    fn test_simple_channel_integration() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(5);
+
+        // Test sending and receiving
+        sender.append(vec![1, 2, 3]);
+
+        let slice = receiver.try_slice(0..=2).unwrap();
+        assert_eq!(slice.as_ref(), &[1, 2, 3]);
+
+        receiver.consume_exact(3);
+    }
 }

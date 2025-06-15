@@ -786,6 +786,24 @@ mod tests {
         Ok(())
     }
 
+    // #[test]
+    // fn receive_works_after_sender_drop() -> TestResult {
+    //     let (sender, mut receiver) = create_bounded(4);
+    //     sender.try_send(vec![0, 1, 2, 3])?;
+    //     drop(sender);
+
+    //     assert_eq!(receiver.len(), 4);
+    //     assert_eq!(receiver.recv(1), vec![0]);
+    //     assert_eq!(receiver.try_recv_exact(2), Ok(vec![1, 2]));
+    //     assert_eq!(receiver.try_recv_exact(2), Err(RecvError::Dropped(1)));
+    //     assert_eq!(receiver.len(), 1);
+    //     assert_eq!(receiver.recv(1), Ok(vec![3]));
+
+    //     assert_eq!(receiver.recv(1), Err(RecvError::Dropped(0)));
+
+    //     Ok(())
+    // }
+
     #[test]
     fn elements_dropped_correctly() -> TestResult {
         let (mut sender, mut receiver) = create_bounded(4);

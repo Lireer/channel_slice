@@ -10,13 +10,14 @@ name = "benchmarks"
 harness = false
 
 [dependencies]
-thiserror = "2.0.4"
+rtrb = "0.3.2"
+thiserror = "2.0.12"
 # triomphe = "0.1.9"
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["html_reports"] }
-parking_lot = "0.12.1"
-spin_sleep = "1.2.1"
+parking_lot = "0.12.4"
+spin_sleep = "1.3.1"
 testresult = "0.4.1"
 
 [target.'cfg(loom)'.dependencies]
