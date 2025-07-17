@@ -1,10 +1,30 @@
 use std::{
     collections::VecDeque,
-    ops::Range,
+    ops::{Bound, RangeBounds},
     sync::{Arc, Condvar, Mutex},
 };
 
 use crate::{SliceChannelReceiver, SliceChannelSender};
+
+/// Helper function to convert RangeBounds to concrete start and end indices
+fn range_bounds_to_indices<R>(range: R, len: usize) -> (usize, usize)
+where
+    R: RangeBounds<usize>,
+{
+    let start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start + 1,
+        Bound::Unbounded => 0,
+    };
+
+    let end = match range.end_bound() {
+        Bound::Included(&end) => end + 1,
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => len,
+    };
+
+    (start, end)
+}
 
 /// Shared state for the simple channel implementation
 struct ChannelState<T> {
@@ -205,10 +225,14 @@ impl<T: Clone> SliceChannelReceiver<T> for SimpleReceiver<T> {
     where
         Self: 'a;
 
-    fn slice(&mut self, range: Range<usize>) -> Self::Slice<'_> {
-        let end = range.end;
-
+    fn slice<R>(&mut self, range: R) -> Self::Slice<'_>
+    where
+        R: RangeBounds<usize>,
+    {
         let mut state = self.shared.state.lock().unwrap();
+
+        // Convert RangeBounds to concrete indices
+        let (start, end) = range_bounds_to_indices(range, state.capacity);
 
         // Panic if range end is greater than capacity
         if end > state.capacity {
@@ -227,7 +251,7 @@ impl<T: Clone> SliceChannelReceiver<T> for SimpleReceiver<T> {
         }
 
         // Extract the slice data
-        let slice_data: Vec<T> = state.data.range(range).cloned().collect();
+        let slice_data: Vec<T> = state.data.range(start..end).cloned().collect();
 
         OwnedSlice::new(slice_data)
     }
@@ -284,10 +308,14 @@ impl<T: Clone> SliceChannelReceiver<T> for SimpleReceiver<T> {
         self.shared.space_available.notify_all();
     }
 
-    fn try_slice(&mut self, range: Range<usize>) -> Result<Self::Slice<'_>, usize> {
-        let end = range.end;
-
+    fn try_slice<R>(&mut self, range: R) -> Result<Self::Slice<'_>, usize>
+    where
+        R: RangeBounds<usize>,
+    {
         let state = self.shared.state.lock().unwrap();
+
+        // Convert RangeBounds to concrete indices
+        let (start, end) = range_bounds_to_indices(range, state.capacity);
 
         // Panic if range end is greater than capacity
         if end > state.capacity {
@@ -307,7 +335,7 @@ impl<T: Clone> SliceChannelReceiver<T> for SimpleReceiver<T> {
         }
 
         // Extract the slice data
-        let slice_data: Vec<T> = state.data.range(range).cloned().collect();
+        let slice_data: Vec<T> = state.data.range(start..end).cloned().collect();
 
         Ok(OwnedSlice::new(slice_data))
     }
@@ -654,5 +682,65 @@ mod tests {
         assert_eq!(buf3, vec![6]);
 
         assert_eq!(receiver.len(), 0);
+    }
+
+    #[test]
+    fn test_range_exclusive_end() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(10);
+        sender.append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // Range (exclusive end)
+        let slice = receiver.try_slice(1..4).unwrap();
+        assert_eq!(slice.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_range_inclusive_end() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(10);
+        sender.append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // RangeInclusive (inclusive end)
+        let slice = receiver.try_slice(2..=4).unwrap();
+        assert_eq!(slice.as_ref(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn test_range_from() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(10);
+        sender.append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // RangeFrom (from start to end)
+        let slice = receiver.try_slice(3..).unwrap();
+        assert_eq!(slice.as_ref(), &[3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_range_to_exclusive() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(10);
+        sender.append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // RangeTo (from 0 to end, exclusive)
+        let slice = receiver.try_slice(..5).unwrap();
+        assert_eq!(slice.as_ref(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_range_to_inclusive() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(10);
+        sender.append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // RangeToInclusive (from 0 to end, inclusive)
+        let slice = receiver.try_slice(..=4).unwrap();
+        assert_eq!(slice.as_ref(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_range_full() {
+        let (mut sender, mut receiver) = create_simple_channel::<i32>(10);
+        sender.append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+        // Full range
+        let slice = receiver.try_slice(..).unwrap();
+        assert_eq!(slice.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 }

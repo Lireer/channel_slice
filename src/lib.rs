@@ -1,6 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::ops::{Range, RangeInclusive};
+use std::ops::RangeBounds;
 
 // pub mod bounded;
 // pub mod expl_sync;
@@ -25,14 +25,15 @@ pub trait SliceChannelReceiver<T> {
     where
         Self: 'a;
 
-    /// View the elements in the index `range`, blocking if not enough elemindexents are available.
+    /// View the elements in the index `range`, blocking if not enough elements are available.
     ///
     /// # Panics
     ///
     /// Implementors of this trait should panic if the end of the range is greater than `Self`'s
     /// capacity.
-    // TODO: Replace `Range` with `std::ops::RangeBounds`.
-    fn slice(&mut self, range: Range<usize>) -> Self::Slice<'_>;
+    fn slice<R>(&mut self, range: R) -> Self::Slice<'_>
+    where
+        R: RangeBounds<usize>;
     /// Remove the next `n` elements and append them to `buf`, blocking if not enough elements are
     /// available.
     ///
@@ -52,8 +53,9 @@ pub trait SliceChannelReceiver<T> {
     ///
     /// Returns `Err(usize)` if there are not enough elements in `Self` with the value indicating
     /// how many more elements have to be in `Self` for the same call to succeed.
-    // TODO: Replace `Range` with `std::ops::RangeBounds`.
-    fn try_slice(&mut self, range: Range<usize>) -> Result<Self::Slice<'_>, usize>;
+    fn try_slice<R>(&mut self, range: R) -> Result<Self::Slice<'_>, usize>
+    where
+        R: RangeBounds<usize>;
     fn try_pop(&mut self, n: usize, buf: &mut Vec<T>) -> Result<(), usize>;
     /// Consume and drop the next `n` elements in the buffer.
     ///

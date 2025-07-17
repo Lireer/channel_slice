@@ -36,8 +36,28 @@
 
 use crate::{SliceChannelReceiver, SliceChannelSender};
 use rtrb::{chunks::ChunkError, Consumer, Producer, RingBuffer};
-use std::ops::Range;
+use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Helper function to convert RangeBounds to concrete start and end indices
+fn range_bounds_to_indices<R>(range: R, len: usize) -> (usize, usize)
+where
+    R: RangeBounds<usize>,
+{
+    let start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start + 1,
+        Bound::Unbounded => 0,
+    };
+
+    let end = match range.end_bound() {
+        Bound::Included(&end) => end + 1,
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => len,
+    };
+
+    (start, end)
+}
 
 /// Create a bounded channel pair using rtrb with the given capacity.
 pub fn create_bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
@@ -236,9 +256,12 @@ where
     where
         Self: 'a;
 
-    fn slice(&mut self, range: Range<usize>) -> Self::Slice<'_> {
-        let start = range.start;
-        let end = range.end;
+    fn slice<R>(&mut self, range: R) -> Self::Slice<'_>
+    where
+        R: RangeBounds<usize>,
+    {
+        // Convert RangeBounds to concrete indices
+        let (start, end) = range_bounds_to_indices(range, self.consumer.buffer().capacity());
         let len = end - start;
 
         // Check if the range is valid for the capacity
@@ -313,9 +336,12 @@ where
         }
     }
 
-    fn try_slice(&mut self, range: Range<usize>) -> Result<Self::Slice<'_>, usize> {
-        let start = range.start;
-        let end = range.end;
+    fn try_slice<R>(&mut self, range: R) -> Result<Self::Slice<'_>, usize>
+    where
+        R: RangeBounds<usize>,
+    {
+        // Convert RangeBounds to concrete indices
+        let (start, end) = range_bounds_to_indices(range, self.consumer.buffer().capacity());
         let len = end - start;
 
         // Check if the range is valid for the capacity
@@ -581,5 +607,65 @@ mod tests {
         sender_handle.join().unwrap();
         let received = receiver_handle.join().unwrap();
         assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn test_range_exclusive_end() {
+        let (mut sender, mut receiver) = create_bounded::<i32>(10);
+        sender
+            .try_append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        let slice = receiver.try_slice(1..4).unwrap();
+        assert_eq!(slice.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_range_inclusive_end() {
+        let (mut sender, mut receiver) = create_bounded::<i32>(10);
+        sender
+            .try_append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        let slice = receiver.try_slice(2..=4).unwrap();
+        assert_eq!(slice.as_ref(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn test_range_from() {
+        let (mut sender, mut receiver) = create_bounded::<i32>(10);
+        sender
+            .try_append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        let slice = receiver.try_slice(3..).unwrap();
+        assert_eq!(slice.as_ref(), &[3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_range_to_exclusive() {
+        let (mut sender, mut receiver) = create_bounded::<i32>(10);
+        sender
+            .try_append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        let slice = receiver.try_slice(..5).unwrap();
+        assert_eq!(slice.as_ref(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_range_to_inclusive() {
+        let (mut sender, mut receiver) = create_bounded::<i32>(10);
+        sender
+            .try_append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        let slice = receiver.try_slice(..=4).unwrap();
+        assert_eq!(slice.as_ref(), &[0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_range_full() {
+        let (mut sender, mut receiver) = create_bounded::<i32>(10);
+        sender
+            .try_append(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+            .unwrap();
+        let slice = receiver.try_slice(..).unwrap();
+        assert_eq!(slice.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 }
